@@ -36,6 +36,7 @@ struct ContentView: View {
                                 .textFieldStyle(.roundedBorder)
                                 .font(.system(size: 12, design: .monospaced))
                                 .disabled(runner.isRunning)
+                                .onSubmit { runner.onPathChanged() }
                         }
                         #else
                         Button(action: { showFolderPicker = true }) {
@@ -55,6 +56,7 @@ struct ContentView: View {
                             if case .success(let url) = result {
                                 runner.modelURL = url
                                 runner.modelPath = url.path
+                                runner.onPathChanged()
                             }
                         }
                         #endif
@@ -153,6 +155,7 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color(red: 0.08, green: 0.08, blue: 0.10))
             .navigationTitle("SwiftLLM")
+            .onAppear { runner.autoLoadIfNeeded() }
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif

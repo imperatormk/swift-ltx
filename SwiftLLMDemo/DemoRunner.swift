@@ -39,9 +39,57 @@ final class DemoRunner: ObservableObject {
     private var model: LlamaModel?
     private var tokenizer: Tokenizer?
     nonisolated(unsafe) private var _shouldStop = false
+    private var hasAutoLoaded = false
 
     func stop() {
         _shouldStop = true
+    }
+
+    func autoLoadIfNeeded() {
+        guard !hasAutoLoaded, model == nil, !modelPath.isEmpty, !isRunning else { return }
+        hasAutoLoaded = true
+        loadModel()
+    }
+
+    func onPathChanged() {
+        model = nil
+        tokenizer = nil
+        hasAutoLoaded = false
+        loadModel()
+    }
+
+    private func loadModel() {
+        let path = modelURL?.path ?? modelPath
+        guard !path.isEmpty else { return }
+        isRunning = true
+        statusText = "Loading model..."
+
+        let url = modelURL
+        Thread.detachNewThread { [weak self] in
+            let dir: URL
+            if let url {
+                dir = url
+                _ = url.startAccessingSecurityScopedResource()
+            } else {
+                dir = URL(fileURLWithPath: path)
+            }
+            do {
+                let tok = try Tokenizer(from: dir.appendingPathComponent("tokenizer.json"))
+                DispatchQueue.main.async { [weak self] in self?.statusText = "Loading weights..." }
+                let m = try LlamaModel(directory: dir)
+                DispatchQueue.main.async { [weak self] in
+                    self?.model = m
+                    self?.tokenizer = tok
+                    self?.statusText = "Model loaded (\(m.config.numHiddenLayers)L, \(m.config.numAttentionHeads)H)"
+                    self?.isRunning = false
+                }
+            } catch {
+                DispatchQueue.main.async { [weak self] in
+                    self?.statusText = "Error: \(error)"
+                    self?.isRunning = false
+                }
+            }
+        }
     }
 
     var deviceName: String {
