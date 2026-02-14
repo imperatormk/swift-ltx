@@ -91,30 +91,47 @@ public struct Tokenizer: Sendable {
         self.eotId = eot
     }
 
-    /// Encode text to token IDs using byte-level BPE.
+    // Llama 3 pre-tokenizer regex (matches the HuggingFace tokenizer.json pattern).
+    // Splits text into words/numbers/punctuation chunks before BPE.
+    private static let pretokPattern: NSRegularExpression = {
+        let pattern = #"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"#
+        return try! NSRegularExpression(pattern: pattern)
+    }()
+
+    /// Encode text to token IDs using byte-level BPE with pre-tokenization.
     public func encode(_ text: String) -> [Int] {
-        // Map each byte through GPT-2 byte→unicode table
-        var tokens: [String] = text.utf8.map { byte in
-            String(Tokenizer.byteToUnicode[byte]!)
-        }
+        // Pre-tokenize: split text into chunks using the Llama 3 regex
+        let nsText = text as NSString
+        let matches = Tokenizer.pretokPattern.matches(in: text, range: NSRange(location: 0, length: nsText.length))
 
-        // BPE: repeatedly find and apply the highest-priority (lowest rank) merge
-        while tokens.count >= 2 {
-            var bestRank = Int.max
-            var bestIdx = -1
-            for i in 0..<(tokens.count - 1) {
-                let key = "\(tokens[i]) \(tokens[i+1])"
-                if let rank = mergeRanks[key], rank < bestRank {
-                    bestRank = rank
-                    bestIdx = i
-                }
+        var result: [Int] = []
+        for match in matches {
+            let chunk = nsText.substring(with: match.range)
+
+            // Map each byte through GPT-2 byte→unicode table
+            var tokens: [String] = chunk.utf8.map { byte in
+                String(Tokenizer.byteToUnicode[byte]!)
             }
-            if bestIdx < 0 { break }
-            tokens[bestIdx] = tokens[bestIdx] + tokens[bestIdx + 1]
-            tokens.remove(at: bestIdx + 1)
-        }
 
-        return tokens.compactMap { vocab[$0] }
+            // BPE: repeatedly find and apply the highest-priority (lowest rank) merge
+            while tokens.count >= 2 {
+                var bestRank = Int.max
+                var bestIdx = -1
+                for i in 0..<(tokens.count - 1) {
+                    let key = "\(tokens[i]) \(tokens[i+1])"
+                    if let rank = mergeRanks[key], rank < bestRank {
+                        bestRank = rank
+                        bestIdx = i
+                    }
+                }
+                if bestIdx < 0 { break }
+                tokens[bestIdx] = tokens[bestIdx] + tokens[bestIdx + 1]
+                tokens.remove(at: bestIdx + 1)
+            }
+
+            result += tokens.compactMap { vocab[$0] }
+        }
+        return result
     }
 
     /// Decode token IDs back to text.
@@ -128,12 +145,19 @@ public struct Tokenizer: Sendable {
     /// Wrap user text in Llama 3 chat template tokens.
     public func chatTokens(for text: String) -> [Int] {
         if startHeaderId >= 0 {
-            // Llama 3 format
-            let userText = encode(text)
+            // Llama 3 format with system prompt
             let nl = encode("\n\n")
+            let system = encode("system")
+            let systemMsg = encode("Cutting Knowledge Date: December 2023\nToday Date: 14 Feb 2026\n\nYou are a helpful assistant.")
             let user = encode("user")
+            let userText = encode(text)
             let assistant = encode("assistant")
             var result = [bosToken, startHeaderId]
+            result += system
+            result += [endHeaderId]
+            result += nl
+            result += systemMsg
+            result += [eotId, startHeaderId]
             result += user
             result += [endHeaderId]
             result += nl

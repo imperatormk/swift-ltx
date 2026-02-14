@@ -158,13 +158,15 @@ public final class KernelCache: @unchecked Sendable {
         dst[s * nHeads * headDim + h * headDim + d] = src[h * seqLen * headDim + s * headDim + d];
     }
 
-    // RoPE (Rotary Position Embedding) — applied in-place to Q and K.
+    // RoPE (Rotary Position Embedding) with precomputed frequencies.
+    // Uses half-dim split pairing: pair i rotates (x[i], x[i + D/2]).
     kernel void rope(
-        device float* x [[buffer(0)]],
-        constant uint& headDim [[buffer(1)]],
-        constant uint& startPos [[buffer(2)]],
-        constant float& theta [[buffer(3)]],
-        constant uint& seqLen [[buffer(4)]],
+        device const float* src [[buffer(0)]],
+        device float* dst [[buffer(1)]],
+        constant uint& headDim [[buffer(2)]],
+        constant uint& startPos [[buffer(3)]],
+        device const float* freqs [[buffer(4)]],
+        constant uint& seqLen [[buffer(5)]],
         uint2 tid [[thread_position_in_grid]])
     {
         uint pair = tid.x;
@@ -172,17 +174,75 @@ public final class KernelCache: @unchecked Sendable {
         uint seq_offset = hs % seqLen;
         uint position = startPos + seq_offset;
 
-        uint base = hs * headDim + pair * 2;
+        uint halfDim = headDim / 2;
+        uint idx0 = hs * headDim + pair;
+        uint idx1 = idx0 + halfDim;
 
-        float freq = 1.0f / pow(theta, float(pair * 2) / float(headDim));
+        float freq = freqs[pair];
         float angle = float(position) * freq;
         float cos_a = cos(angle);
         float sin_a = sin(angle);
 
-        float x0 = x[base];
-        float x1 = x[base + 1];
-        x[base]     = x0 * cos_a - x1 * sin_a;
-        x[base + 1] = x0 * sin_a + x1 * cos_a;
+        float x0 = src[idx0];
+        float x1 = src[idx1];
+        dst[idx0] = x0 * cos_a - x1 * sin_a;
+        dst[idx1] = x0 * sin_a + x1 * cos_a;
+    }
+
+    // Copy a contiguous slice from src to dst (uint4 = 16 bytes per thread).
+    kernel void copy_slice(
+        device const uint4* src [[buffer(0)]],
+        device uint4* dst [[buffer(1)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        dst[tid] = src[tid];
+    }
+
+    // GPU zero-fill (uint4 = 16 bytes per thread for bandwidth).
+    kernel void fill_zero(
+        device uint4* dst [[buffer(0)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        dst[tid] = uint4(0);
+    }
+
+    // KV cache append: copy [numKVHeads, seqLen, headDim] into strided [numKVHeads, maxSeqLen, headDim]
+    // Grid: (headDim, numKVHeads * seqLen) threads
+    kernel void kv_append(
+        device const float* src [[buffer(0)]],
+        device float* dst [[buffer(1)]],
+        constant uint& headDim [[buffer(2)]],
+        constant uint& seqLen [[buffer(3)]],
+        constant uint& maxSeqLen [[buffer(4)]],
+        constant uint& startPos [[buffer(5)]],
+        uint2 tid [[thread_position_in_grid]])
+    {
+        uint d = tid.x;
+        uint idx = tid.y;
+        uint h = idx / seqLen;
+        uint s = idx % seqLen;
+        uint src_off = h * seqLen * headDim + s * headDim + d;
+        uint dst_off = h * maxSeqLen * headDim + (startPos + s) * headDim + d;
+        dst[dst_off] = src[src_off];
+    }
+
+    // KV cache compact: copy strided [numKVHeads, maxSeqLen, headDim] → contiguous [numKVHeads, seqLen, headDim]
+    // Grid: (headDim, numKVHeads * seqLen) threads
+    kernel void kv_compact(
+        device const float* src [[buffer(0)]],
+        device float* dst [[buffer(1)]],
+        constant uint& headDim [[buffer(2)]],
+        constant uint& seqLen [[buffer(3)]],
+        constant uint& maxSeqLen [[buffer(4)]],
+        uint2 tid [[thread_position_in_grid]])
+    {
+        uint d = tid.x;
+        uint idx = tid.y;
+        uint h = idx / seqLen;
+        uint s = idx % seqLen;
+        uint src_off = h * maxSeqLen * headDim + s * headDim + d;
+        uint dst_off = h * seqLen * headDim + s * headDim + d;
+        dst[dst_off] = src[src_off];
     }
 
     // Softmax over last dimension (for logits → probs).

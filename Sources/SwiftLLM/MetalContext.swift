@@ -34,14 +34,56 @@ public final class MetalContext: @unchecked Sendable {
         device.makeBuffer(length: length, options: .storageModeShared)!
     }
 
-    /// Run a compute pass synchronously.
+    /// Run a compute pass. If batching is active, appends to the current command
+    /// buffer with a memory barrier. Otherwise creates+commits its own (legacy sync path).
     public func run(_ body: (MTLComputeCommandEncoder) -> Void) {
+        if batching {
+            let enc = encoder()
+            body(enc)
+            return
+        }
         let cmdBuf = commandQueue.makeCommandBuffer()!
         let enc = cmdBuf.makeComputeCommandEncoder()!
         body(enc)
         enc.endEncoding()
         cmdBuf.commit()
         cmdBuf.waitUntilCompleted()
+    }
+
+    // MARK: - Batched dispatch (multiple ops in one command buffer)
+
+    private var _cmdBuf: MTLCommandBuffer?
+    private var _encoder: MTLComputeCommandEncoder?
+
+    /// True when ops should use the batched encoder instead of individual run() calls.
+    public private(set) var batching: Bool = false
+
+    /// Begin batching: subsequent calls to encoder() share one command buffer.
+    public func beginBatch() {
+        let cmdBuf = commandQueue.makeCommandBuffer()!
+        let enc = cmdBuf.makeComputeCommandEncoder()!
+        _cmdBuf = cmdBuf
+        _encoder = enc
+        batching = true
+    }
+
+    /// Get the current batched encoder. Inserts a memory barrier between dispatches.
+    /// Only valid between beginBatch() and endBatch().
+    public func encoder() -> MTLComputeCommandEncoder {
+        let enc = _encoder!
+        enc.memoryBarrier(scope: .buffers)
+        return enc
+    }
+
+    /// End batching: commit and wait for all queued work.
+    public func endBatch() {
+        guard let enc = _encoder, let cmdBuf = _cmdBuf else { return }
+        enc.endEncoding()
+        cmdBuf.commit()
+        cmdBuf.waitUntilCompleted()
+        _encoder = nil
+        _cmdBuf = nil
+        batching = false
     }
 }
 

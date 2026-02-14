@@ -7,23 +7,20 @@ import FlashAttention
 
 public func rmsNorm(_ x: Tensor, weight: Tensor, eps: Float, dim: Int) -> Tensor {
     let rows = x.count / dim
-    let out = Tensor.zeros([rows, dim])
-    let ctx = MetalContext.shared
+    let out = Tensor.empty([rows, dim])
     let pipe = KernelCache.shared.pipeline("rms_norm")
 
     var d = UInt32(dim)
     var e = eps
-    let dBuf = ctx.makePooledBuffer(&d, length: 4)
-    let eBuf = ctx.makePooledBuffer(&e, length: 4)
 
     let tgSize = min(256, dim)
-    ctx.run { enc in
+    MetalContext.shared.run { enc in
         enc.setComputePipelineState(pipe)
         enc.setBuffer(x.buffer, offset: 0, index: 0)
         enc.setBuffer(weight.buffer, offset: 0, index: 1)
         enc.setBuffer(out.buffer, offset: 0, index: 2)
-        enc.setBuffer(dBuf, offset: 0, index: 3)
-        enc.setBuffer(eBuf, offset: 0, index: 4)
+        enc.setBytes(&d, length: 4, index: 3)
+        enc.setBytes(&e, length: 4, index: 4)
         enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
                                 threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
     }
@@ -31,7 +28,7 @@ public func rmsNorm(_ x: Tensor, weight: Tensor, eps: Float, dim: Int) -> Tensor
 }
 
 public func silu(_ x: Tensor) -> Tensor {
-    let out = Tensor.zeros(x.shape)
+    let out = Tensor.empty(x.shape)
     let pipe = KernelCache.shared.pipeline("silu")
     MetalContext.shared.run { enc in
         enc.setComputePipelineState(pipe)
@@ -45,7 +42,7 @@ public func silu(_ x: Tensor) -> Tensor {
 
 /// Fused SiLU(a) * b — saves a kernel launch and memory round-trip.
 public func siluMul(_ a: Tensor, _ b: Tensor) -> Tensor {
-    let out = Tensor.zeros(a.shape)
+    let out = Tensor.empty(a.shape)
     let pipe = KernelCache.shared.pipeline("silu_mul")
     MetalContext.shared.run { enc in
         enc.setComputePipelineState(pipe)
@@ -59,7 +56,7 @@ public func siluMul(_ a: Tensor, _ b: Tensor) -> Tensor {
 }
 
 public func elemMul(_ a: Tensor, _ b: Tensor) -> Tensor {
-    let out = Tensor.zeros(a.shape)
+    let out = Tensor.empty(a.shape)
     let pipe = KernelCache.shared.pipeline("mul")
     MetalContext.shared.run { enc in
         enc.setComputePipelineState(pipe)
@@ -73,7 +70,7 @@ public func elemMul(_ a: Tensor, _ b: Tensor) -> Tensor {
 }
 
 public func elemAdd(_ a: Tensor, _ b: Tensor) -> Tensor {
-    let out = Tensor.zeros(a.shape)
+    let out = Tensor.empty(a.shape)
     let pipe = KernelCache.shared.pipeline("add")
     MetalContext.shared.run { enc in
         enc.setComputePipelineState(pipe)
@@ -87,43 +84,35 @@ public func elemAdd(_ a: Tensor, _ b: Tensor) -> Tensor {
 }
 
 public func embedding(table: Tensor, tokenId: Int, dim: Int) -> Tensor {
-    let out = Tensor.zeros([dim])
+    let out = Tensor.empty([dim])
     var tid = UInt32(tokenId)
     var d = UInt32(dim)
-    let ctx = MetalContext.shared
-    let tidBuf = ctx.makePooledBuffer(&tid, length: 4)
-    let dBuf = ctx.makePooledBuffer(&d, length: 4)
     let pipe = KernelCache.shared.pipeline("embedding")
 
-    ctx.run { enc in
+    MetalContext.shared.run { enc in
         enc.setComputePipelineState(pipe)
         enc.setBuffer(table.buffer, offset: 0, index: 0)
         enc.setBuffer(out.buffer, offset: 0, index: 1)
-        enc.setBuffer(tidBuf, offset: 0, index: 2)
-        enc.setBuffer(dBuf, offset: 0, index: 3)
+        enc.setBytes(&tid, length: 4, index: 2)
+        enc.setBytes(&d, length: 4, index: 3)
         enc.dispatchThreads(MTLSize(width: dim, height: 1, depth: 1),
                            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
     return out
 }
 
-/// Batch embedding lookup: [numTokens] → [numTokens, dim]
 /// Transpose [seqLen, nHeads, headDim] → [nHeads, seqLen, headDim]
 public func transposeSH(_ x: Tensor, seqLen: Int, nHeads: Int, headDim: Int) -> Tensor {
-    let out = Tensor.zeros([nHeads, seqLen, headDim])
+    let out = Tensor.empty([nHeads, seqLen, headDim])
     var sl = UInt32(seqLen), nh = UInt32(nHeads), hd = UInt32(headDim)
-    let ctx = MetalContext.shared
-    let slBuf = ctx.makePooledBuffer(&sl, length: 4)
-    let nhBuf = ctx.makePooledBuffer(&nh, length: 4)
-    let hdBuf = ctx.makePooledBuffer(&hd, length: 4)
     let pipe = KernelCache.shared.pipeline("transpose_sh")
-    ctx.run { enc in
+    MetalContext.shared.run { enc in
         enc.setComputePipelineState(pipe)
         enc.setBuffer(x.buffer, offset: 0, index: 0)
         enc.setBuffer(out.buffer, offset: 0, index: 1)
-        enc.setBuffer(slBuf, offset: 0, index: 2)
-        enc.setBuffer(nhBuf, offset: 0, index: 3)
-        enc.setBuffer(hdBuf, offset: 0, index: 4)
+        enc.setBytes(&sl, length: 4, index: 2)
+        enc.setBytes(&nh, length: 4, index: 3)
+        enc.setBytes(&hd, length: 4, index: 4)
         enc.dispatchThreads(MTLSize(width: headDim, height: seqLen * nHeads, depth: 1),
                            threadsPerThreadgroup: MTLSize(width: min(headDim, 256), height: 1, depth: 1))
     }
@@ -132,20 +121,16 @@ public func transposeSH(_ x: Tensor, seqLen: Int, nHeads: Int, headDim: Int) -> 
 
 /// Transpose [nHeads, seqLen, headDim] → [seqLen, nHeads, headDim]
 public func transposeHS(_ x: Tensor, seqLen: Int, nHeads: Int, headDim: Int) -> Tensor {
-    let out = Tensor.zeros([seqLen, nHeads, headDim])
+    let out = Tensor.empty([seqLen, nHeads, headDim])
     var sl = UInt32(seqLen), nh = UInt32(nHeads), hd = UInt32(headDim)
-    let ctx = MetalContext.shared
-    let slBuf = ctx.makePooledBuffer(&sl, length: 4)
-    let nhBuf = ctx.makePooledBuffer(&nh, length: 4)
-    let hdBuf = ctx.makePooledBuffer(&hd, length: 4)
     let pipe = KernelCache.shared.pipeline("transpose_hs")
-    ctx.run { enc in
+    MetalContext.shared.run { enc in
         enc.setComputePipelineState(pipe)
         enc.setBuffer(x.buffer, offset: 0, index: 0)
         enc.setBuffer(out.buffer, offset: 0, index: 1)
-        enc.setBuffer(slBuf, offset: 0, index: 2)
-        enc.setBuffer(nhBuf, offset: 0, index: 3)
-        enc.setBuffer(hdBuf, offset: 0, index: 4)
+        enc.setBytes(&sl, length: 4, index: 2)
+        enc.setBytes(&nh, length: 4, index: 3)
+        enc.setBytes(&hd, length: 4, index: 4)
         enc.dispatchThreads(MTLSize(width: headDim, height: nHeads * seqLen, depth: 1),
                            threadsPerThreadgroup: MTLSize(width: min(headDim, 256), height: 1, depth: 1))
     }
@@ -155,12 +140,11 @@ public func transposeHS(_ x: Tensor, seqLen: Int, nHeads: Int, headDim: Int) -> 
 /// Batch embedding lookup: [numTokens] → [numTokens, dim]
 public func embeddingBatch(table: Tensor, tokenIds: [Int], dim: Int) -> Tensor {
     let n = tokenIds.count
-    let out = Tensor.zeros([n, dim])
+    let out = Tensor.empty([n, dim])
     var ids = tokenIds.map { UInt32($0) }
     let ctx = MetalContext.shared
     let idsBuf = ctx.makePooledBuffer(&ids, length: n * 4)
     var d = UInt32(dim)
-    let dBuf = ctx.makePooledBuffer(&d, length: 4)
     let pipe = KernelCache.shared.pipeline("embedding_batch")
 
     ctx.run { enc in
@@ -168,7 +152,7 @@ public func embeddingBatch(table: Tensor, tokenIds: [Int], dim: Int) -> Tensor {
         enc.setBuffer(table.buffer, offset: 0, index: 0)
         enc.setBuffer(out.buffer, offset: 0, index: 1)
         enc.setBuffer(idsBuf, offset: 0, index: 2)
-        enc.setBuffer(dBuf, offset: 0, index: 3)
+        enc.setBytes(&d, length: 4, index: 3)
         enc.dispatchThreads(MTLSize(width: dim, height: n, depth: 1),
                            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
@@ -178,14 +162,12 @@ public func embeddingBatch(table: Tensor, tokenIds: [Int], dim: Int) -> Tensor {
 /// Batch quantized embedding lookup: [numTokens] → [numTokens, K]
 public func embeddingQ4Batch(weight: Tensor, scales: Tensor, biases: Tensor, tokenIds: [Int], K: Int, groupSize: Int) -> Tensor {
     let n = tokenIds.count
-    let out = Tensor.zeros([n, K])
+    let out = Tensor.empty([n, K])
     var ids = tokenIds.map { UInt32($0) }
     let ctx = MetalContext.shared
     let idsBuf = ctx.makePooledBuffer(&ids, length: n * 4)
     var k = UInt32(K)
     var gs = UInt32(groupSize)
-    let kBuf = ctx.makePooledBuffer(&k, length: 4)
-    let gsBuf = ctx.makePooledBuffer(&gs, length: 4)
     let pipe = KernelCache.shared.pipeline("embedding_q4_batch")
 
     ctx.run { enc in
@@ -195,8 +177,8 @@ public func embeddingQ4Batch(weight: Tensor, scales: Tensor, biases: Tensor, tok
         enc.setBuffer(biases.buffer, offset: 0, index: 2)
         enc.setBuffer(out.buffer, offset: 0, index: 3)
         enc.setBuffer(idsBuf, offset: 0, index: 4)
-        enc.setBuffer(kBuf, offset: 0, index: 5)
-        enc.setBuffer(gsBuf, offset: 0, index: 6)
+        enc.setBytes(&k, length: 4, index: 5)
+        enc.setBytes(&gs, length: 4, index: 6)
         enc.dispatchThreads(MTLSize(width: K, height: n, depth: 1),
                            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
@@ -204,58 +186,46 @@ public func embeddingQ4Batch(weight: Tensor, scales: Tensor, biases: Tensor, tok
 }
 
 public func embeddingQ4(weight: Tensor, scales: Tensor, biases: Tensor, tokenId: Int, K: Int, groupSize: Int) -> Tensor {
-    let out = Tensor.zeros([K])
+    let out = Tensor.empty([K])
     var tid = UInt32(tokenId)
     var k = UInt32(K)
     var gs = UInt32(groupSize)
-    let ctx = MetalContext.shared
-    let tidBuf = ctx.makePooledBuffer(&tid, length: 4)
-    let kBuf = ctx.makePooledBuffer(&k, length: 4)
-    let gsBuf = ctx.makePooledBuffer(&gs, length: 4)
     let pipe = KernelCache.shared.pipeline("embedding_q4")
 
-    ctx.run { enc in
+    MetalContext.shared.run { enc in
         enc.setComputePipelineState(pipe)
         enc.setBuffer(weight.buffer, offset: 0, index: 0)
         enc.setBuffer(scales.buffer, offset: 0, index: 1)
         enc.setBuffer(biases.buffer, offset: 0, index: 2)
         enc.setBuffer(out.buffer, offset: 0, index: 3)
-        enc.setBuffer(tidBuf, offset: 0, index: 4)
-        enc.setBuffer(kBuf, offset: 0, index: 5)
-        enc.setBuffer(gsBuf, offset: 0, index: 6)
+        enc.setBytes(&tid, length: 4, index: 4)
+        enc.setBytes(&k, length: 4, index: 5)
+        enc.setBytes(&gs, length: 4, index: 6)
         enc.dispatchThreads(MTLSize(width: K, height: 1, depth: 1),
                            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
     return out
 }
 
-public func rope(_ x: Tensor, headDim: Int, seqLen: Int, startPos: Int, theta: Float) -> Tensor {
-    // x is [nHeads, seqLen, headDim] — modify in-place (copy first, uses pool)
-    let buf = MetalContext.shared.bufferPool.get(length: x.byteCount)
-    memcpy(buf.contents(), x.buffer.contents(), x.byteCount)
-    let out = Tensor(buffer: buf, shape: x.shape)
+public func rope(_ x: Tensor, headDim: Int, seqLen: Int, startPos: Int, freqs: MTLBuffer) -> Tensor {
+    let out = Tensor.empty(x.shape)
 
     var hd = UInt32(headDim)
     var p = UInt32(startPos)
-    var t = theta
     var sl = UInt32(seqLen)
-    let ctx = MetalContext.shared
-    let hdBuf = ctx.makePooledBuffer(&hd, length: 4)
-    let pBuf = ctx.makePooledBuffer(&p, length: 4)
-    let tBuf = ctx.makePooledBuffer(&t, length: 4)
-    let slBuf = ctx.makePooledBuffer(&sl, length: 4)
     let pipe = KernelCache.shared.pipeline("rope")
 
     let nPairs = headDim / 2
     let nHeadSeq = x.count / headDim
 
-    ctx.run { enc in
+    MetalContext.shared.run { enc in
         enc.setComputePipelineState(pipe)
-        enc.setBuffer(out.buffer, offset: 0, index: 0)
-        enc.setBuffer(hdBuf, offset: 0, index: 1)
-        enc.setBuffer(pBuf, offset: 0, index: 2)
-        enc.setBuffer(tBuf, offset: 0, index: 3)
-        enc.setBuffer(slBuf, offset: 0, index: 4)
+        enc.setBuffer(x.buffer, offset: 0, index: 0)   // src
+        enc.setBuffer(out.buffer, offset: 0, index: 1)  // dst
+        enc.setBytes(&hd, length: 4, index: 2)
+        enc.setBytes(&p, length: 4, index: 3)
+        enc.setBuffer(freqs, offset: 0, index: 4)       // precomputed freqs
+        enc.setBytes(&sl, length: 4, index: 5)
         enc.dispatchThreads(MTLSize(width: nPairs, height: nHeadSeq, depth: 1),
                            threadsPerThreadgroup: MTLSize(width: min(nPairs, 32), height: 1, depth: 1))
     }
@@ -265,29 +235,25 @@ public func rope(_ x: Tensor, headDim: Int, seqLen: Int, startPos: Int, theta: F
 // MARK: - Quantized matmul (4-bit)
 
 /// Quantized matmul: out = x @ W^T where W is 4-bit packed.
-/// x: [1, K] float32. Returns [1, N] float32.
+/// x: [M, K] float32. Returns [M, N] float32.
 public func matmulQ4(_ x: Tensor, weight: Tensor, scales: Tensor, biases: Tensor, M: Int, K: Int, N: Int, groupSize: Int) -> Tensor {
-    let out = Tensor.zeros([M, N])
+    let out = Tensor.empty([M, N])
     var k = UInt32(K)
     var gs = UInt32(groupSize)
     var n = UInt32(N)
-    let ctx = MetalContext.shared
-    let kBuf = ctx.makePooledBuffer(&k, length: 4)
-    let gsBuf = ctx.makePooledBuffer(&gs, length: 4)
-    let nBuf = ctx.makePooledBuffer(&n, length: 4)
     let pipe = KernelCache.shared.pipeline("matmul_q4")
 
     let tgSize = 256
-    ctx.run { enc in
+    MetalContext.shared.run { enc in
         enc.setComputePipelineState(pipe)
         enc.setBuffer(x.buffer, offset: 0, index: 0)
         enc.setBuffer(weight.buffer, offset: 0, index: 1)
         enc.setBuffer(scales.buffer, offset: 0, index: 2)
         enc.setBuffer(biases.buffer, offset: 0, index: 3)
         enc.setBuffer(out.buffer, offset: 0, index: 4)
-        enc.setBuffer(kBuf, offset: 0, index: 5)
-        enc.setBuffer(gsBuf, offset: 0, index: 6)
-        enc.setBuffer(nBuf, offset: 0, index: 7)
+        enc.setBytes(&k, length: 4, index: 5)
+        enc.setBytes(&gs, length: 4, index: 6)
+        enc.setBytes(&n, length: 4, index: 7)
         enc.dispatchThreadgroups(MTLSize(width: M * N, height: 1, depth: 1),
                                 threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
     }
@@ -311,10 +277,9 @@ public func matmulQ4Fast(
     gemmDesc.groupSize = UInt32(groupSize)
 
     let (kernel, pipeline) = GEMMKernel.pipeline(for: gemmDesc)
-    let out = Tensor.zeros([M, N])
+    let out = Tensor.empty([M, N])
 
-    let ctx = MetalContext.shared
-    ctx.run { enc in
+    MetalContext.shared.run { enc in
         enc.setComputePipelineState(pipeline)
         enc.setThreadgroupMemoryLength(Int(kernel.threadgroupMemoryAllocation), index: 0)
 
@@ -365,14 +330,25 @@ public func argmax(_ x: Tensor) -> Int {
     return best
 }
 
-/// Temperature sampling with top-p (nucleus) filtering.
-public func sample(_ x: Tensor, temperature: Float = 0.7, topP: Float = 0.9) -> Int {
+/// Temperature sampling with top-p (nucleus) filtering and repetition penalty.
+public func sample(_ x: Tensor, temperature: Float = 0.7, topP: Float = 0.9, repetitionPenalty: Float = 1.1, previousTokens: [Int] = []) -> Int {
     let ptr = x.buffer.contents().assumingMemoryBound(to: Float.self)
     let n = x.count
 
-    // Apply temperature
     var logits = [Float](repeating: 0, count: n)
-    for i in 0..<n { logits[i] = ptr[i] / temperature }
+    for i in 0..<n { logits[i] = ptr[i] }
+
+    // Apply repetition penalty to previously generated tokens
+    for tok in previousTokens where tok < n {
+        if logits[tok] > 0 {
+            logits[tok] /= repetitionPenalty
+        } else {
+            logits[tok] *= repetitionPenalty
+        }
+    }
+
+    // Apply temperature
+    for i in 0..<n { logits[i] /= temperature }
 
     // Softmax
     var maxVal: Float = -.greatestFiniteMagnitude

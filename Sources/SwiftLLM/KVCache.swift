@@ -1,5 +1,6 @@
 // KV Cache for autoregressive decoding.
 // Pre-allocates Metal buffers for max sequence length.
+// All copies (append + compact) use GPU kernels — zero CPU memcpy.
 
 import Metal
 
@@ -12,9 +13,9 @@ public class KVCache {
     // Per-layer K and V buffers: [numKVHeads, maxSeqLen, headDim]
     public var keyBuffers: [MTLBuffer]
     public var valueBuffers: [MTLBuffer]
-    // Reusable compacted buffers (2 per layer: K and V)
-    private var compactKeyBuffers: [MTLBuffer]
-    private var compactValueBuffers: [MTLBuffer]
+    // Single pair of reusable compact buffers (shared across layers)
+    private var compactKeyBuffer: MTLBuffer
+    private var compactValueBuffer: MTLBuffer
     public private(set) var currentLen: Int = 0
 
     public init(numLayers: Int, numKVHeads: Int, headDim: Int, maxSeqLen: Int = 4096) {
@@ -27,27 +28,38 @@ public class KVCache {
         let layerBytes = numKVHeads * maxSeqLen * headDim * 4  // float32
         self.keyBuffers = (0..<numLayers).map { _ in ctx.makeBuffer(length: layerBytes) }
         self.valueBuffers = (0..<numLayers).map { _ in ctx.makeBuffer(length: layerBytes) }
-        self.compactKeyBuffers = (0..<numLayers).map { _ in ctx.makeBuffer(length: layerBytes) }
-        self.compactValueBuffers = (0..<numLayers).map { _ in ctx.makeBuffer(length: layerBytes) }
+        // One shared compact buffer pair — reused across layers (saves ~900MB)
+        self.compactKeyBuffer = ctx.makeBuffer(length: layerBytes)
+        self.compactValueBuffer = ctx.makeBuffer(length: layerBytes)
     }
 
-    /// Append new K, V for `seqLen` tokens starting at position `currentLen`.
+    /// Append new K, V for `seqLen` tokens starting at position `currentLen`. GPU dispatch, no CPU memcpy.
     /// k, v are [numKVHeads, seqLen, headDim].
     public func append(layer: Int, k: Tensor, v: Tensor, seqLen: Int = 1) {
-        let headBytes = headDim * 4
-        let seqStride = maxSeqLen * headBytes
-        let pos = currentLen
+        var hd = UInt32(headDim)
+        var sl = UInt32(seqLen)
+        var msl = UInt32(maxSeqLen)
+        var sp = UInt32(currentLen)
+        let pipe = KernelCache.shared.pipeline("kv_append")
+        let totalThreadsY = numKVHeads * seqLen
 
-        let kSrc = k.buffer.contents()
-        let vSrc = v.buffer.contents()
-        let kDst = keyBuffers[layer].contents()
-        let vDst = valueBuffers[layer].contents()
+        MetalContext.shared.run { enc in
+            // Append K
+            enc.setComputePipelineState(pipe)
+            enc.setBuffer(k.buffer, offset: 0, index: 0)
+            enc.setBuffer(self.keyBuffers[layer], offset: 0, index: 1)
+            enc.setBytes(&hd, length: 4, index: 2)
+            enc.setBytes(&sl, length: 4, index: 3)
+            enc.setBytes(&msl, length: 4, index: 4)
+            enc.setBytes(&sp, length: 4, index: 5)
+            enc.dispatchThreads(MTLSize(width: self.headDim, height: totalThreadsY, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: min(self.headDim, 256), height: 1, depth: 1))
 
-        for h in 0..<numKVHeads {
-            let srcOff = h * seqLen * headBytes
-            let dstOff = h * seqStride + pos * headBytes
-            memcpy(kDst + dstOff, kSrc + srcOff, seqLen * headBytes)
-            memcpy(vDst + dstOff, vSrc + srcOff, seqLen * headBytes)
+            // Append V (same encoder, no barrier needed — different dst buffers)
+            enc.setBuffer(v.buffer, offset: 0, index: 0)
+            enc.setBuffer(self.valueBuffers[layer], offset: 0, index: 1)
+            enc.dispatchThreads(MTLSize(width: self.headDim, height: totalThreadsY, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: min(self.headDim, 256), height: 1, depth: 1))
         }
     }
 
@@ -56,26 +68,34 @@ public class KVCache {
         currentLen += count
     }
 
-    /// Get K tensor for attention: [numKVHeads, seqLen, headDim] (compacted, reuses buffer)
+    /// Get K tensor for attention: [numKVHeads, seqLen, headDim] (compacted on GPU)
     public func keys(layer: Int, seqLen: Int) -> Tensor {
-        return compacted(keyBuffers[layer], into: compactKeyBuffers[layer], seqLen: seqLen)
+        return compactedGPU(keyBuffers[layer], into: compactKeyBuffer, seqLen: seqLen)
     }
 
-    /// Get V tensor for attention: [numKVHeads, seqLen, headDim] (compacted, reuses buffer)
+    /// Get V tensor for attention: [numKVHeads, seqLen, headDim] (compacted on GPU)
     public func values(layer: Int, seqLen: Int) -> Tensor {
-        return compacted(valueBuffers[layer], into: compactValueBuffers[layer], seqLen: seqLen)
+        return compactedGPU(valueBuffers[layer], into: compactValueBuffer, seqLen: seqLen)
     }
 
-    /// Copy strided [numKVHeads, maxSeqLen, headDim] → contiguous [numKVHeads, seqLen, headDim]
-    private func compacted(_ buf: MTLBuffer, into out: MTLBuffer, seqLen: Int) -> Tensor {
-        let headBytes = headDim * 4
-        let srcStride = maxSeqLen * headBytes
-        let dstStride = seqLen * headBytes
-        let src = buf.contents()
-        let dst = out.contents()
-        for h in 0..<numKVHeads {
-            memcpy(dst + h * dstStride, src + h * srcStride, seqLen * headBytes)
+    /// GPU compact: strided [numKVHeads, maxSeqLen, headDim] → contiguous [numKVHeads, seqLen, headDim]
+    private func compactedGPU(_ buf: MTLBuffer, into out: MTLBuffer, seqLen: Int) -> Tensor {
+        var hd = UInt32(headDim)
+        var sl = UInt32(seqLen)
+        var msl = UInt32(maxSeqLen)
+        let pipe = KernelCache.shared.pipeline("kv_compact")
+
+        MetalContext.shared.run { enc in
+            enc.setComputePipelineState(pipe)
+            enc.setBuffer(buf, offset: 0, index: 0)
+            enc.setBuffer(out, offset: 0, index: 1)
+            enc.setBytes(&hd, length: 4, index: 2)
+            enc.setBytes(&sl, length: 4, index: 3)
+            enc.setBytes(&msl, length: 4, index: 4)
+            enc.dispatchThreads(MTLSize(width: self.headDim, height: self.numKVHeads * seqLen, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: min(self.headDim, 256), height: 1, depth: 1))
         }
+
         return Tensor(buffer: out, shape: [numKVHeads, seqLen, headDim])
     }
 

@@ -4,6 +4,7 @@ import SwiftLLM
 struct ContentView: View {
     @StateObject private var runner = DemoRunner()
     @State private var showFolderPicker = false
+    @State private var showDebug = false
 
     var body: some View {
         NavigationStack {
@@ -74,6 +75,32 @@ struct ContentView: View {
                         .tint(.cyan)
                         .disabled(runner.isRunning)
 
+                        // Temperature slider
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Image(systemName: "thermometer.medium")
+                                    .foregroundStyle(.orange)
+                                Text(String(format: "Temperature: %.1f", runner.temperature))
+                                    .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                                    .foregroundStyle(.white)
+                            }
+                            Slider(value: $runner.temperature, in: 0...1.5, step: 0.1)
+                                .tint(.orange)
+                                .disabled(runner.isRunning)
+                        }
+
+                        // Debug toggle
+                        Toggle(isOn: $showDebug) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "ladybug")
+                                    .foregroundStyle(.yellow)
+                                Text("Debug Log")
+                                    .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                                    .foregroundStyle(.white)
+                            }
+                        }
+                        .tint(.yellow)
+
                         // Status
                         Text(runner.statusText)
                             .font(.system(size: 12, weight: .medium, design: .monospaced))
@@ -95,6 +122,38 @@ struct ContentView: View {
                             .clipShape(RoundedRectangle(cornerRadius: 8))
                         }
 
+                        // Debug log
+                        if showDebug, !runner.debugLog.isEmpty {
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack {
+                                    Text("DEBUG")
+                                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                        .foregroundStyle(.yellow)
+                                    Spacer()
+                                    Button(action: {
+                                        #if os(iOS)
+                                        UIPasteboard.general.string = runner.debugLog
+                                        #else
+                                        NSPasteboard.general.clearContents()
+                                        NSPasteboard.general.setString(runner.debugLog, forType: .string)
+                                        #endif
+                                    }) {
+                                        Image(systemName: "doc.on.doc")
+                                            .font(.system(size: 12))
+                                            .foregroundStyle(.yellow.opacity(0.6))
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                                Text(runner.debugLog)
+                                    .font(.system(size: 10, weight: .regular, design: .monospaced))
+                                    .foregroundStyle(.yellow.opacity(0.8))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .padding(10)
+                            .background(Color.yellow.opacity(0.04))
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                        }
+
                         // History
                         ForEach(runner.results) { result in
                             VStack(alignment: .leading, spacing: 6) {
@@ -107,9 +166,23 @@ struct ContentView: View {
                                 HStack {
                                     Text(result.usedFlash ? "FLASH" : "NAIVE")
                                         .foregroundStyle(result.usedFlash ? .cyan : .orange)
-                                    Text("\(result.tokenCount) tok")
-                                    Text(String(format: "%.1f tok/s", result.tokPerSec))
-                                    Text(String(format: "TTFT %.2fs", result.ttft))
+                                    Text(String(format: "P:%.0f", result.prefillTokPerSec))
+                                    Text(String(format: "D:%.1f", result.tokPerSec))
+                                    Text("tok/s")
+                                    Spacer()
+                                    Button(action: {
+                                        #if os(iOS)
+                                        UIPasteboard.general.string = result.output
+                                        #else
+                                        NSPasteboard.general.clearContents()
+                                        NSPasteboard.general.setString(result.output, forType: .string)
+                                        #endif
+                                    }) {
+                                        Image(systemName: "doc.on.doc")
+                                            .font(.system(size: 12))
+                                            .foregroundStyle(.gray)
+                                    }
+                                    .buttonStyle(.plain)
                                 }
                                 .font(.system(size: 11, weight: .medium, design: .monospaced))
                                 .foregroundStyle(.gray)

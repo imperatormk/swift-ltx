@@ -8,13 +8,13 @@ let package = Package(
         .library(name: "SwiftLLM", targets: ["SwiftLLM"]),
     ],
     dependencies: [
-        .package(path: "../metal-flash-attention-upstream"),  // FlashAttention kernels (includes MetalASM)
+        .package(path: "../mps-flash-attention/metal-flash-attention"),  // FlashAttention kernels (includes MetalASM)
     ],
     targets: [
         .target(
             name: "SwiftLLM",
             dependencies: [
-                .product(name: "FlashAttention", package: "metal-flash-attention-upstream"),
+                .product(name: "FlashAttention", package: "metal-flash-attention"),
             ]
         ),
         .testTarget(

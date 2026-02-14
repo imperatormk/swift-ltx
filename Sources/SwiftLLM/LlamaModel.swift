@@ -10,6 +10,7 @@ public class LlamaModel: @unchecked Sendable {
     private let weights: ModelWeights
     private let cache: KVCache
     public var useFlashAttention: Bool = true
+    private let ropeFreqsBuf: MTLBuffer
 
     /// Cached dynamic-RC decode kernel (compiled once, reused for all C values).
     private var dynamicDecodeKernel: AttentionKernel?
@@ -23,6 +24,47 @@ public class LlamaModel: @unchecked Sendable {
             numLayers: config.numHiddenLayers,
             numKVHeads: config.numKeyValueHeads,
             headDim: config.headDim)
+        self.ropeFreqsBuf = LlamaModel.computeRopeFreqs(config: config)
+    }
+
+    private static func computeRopeFreqs(config: ModelConfig) -> MTLBuffer {
+        let nPairs = config.headDim / 2
+        var freqs = [Float](repeating: 0, count: nPairs)
+        let theta = config.ropeTheta
+
+        // Base inverse frequencies
+        for i in 0..<nPairs {
+            freqs[i] = 1.0 / pow(theta, Float(2 * i) / Float(config.headDim))
+        }
+
+        // Apply llama3 scaling if present
+        if let scaling = config.ropeScaling, scaling.ropeType == "llama3" {
+            let factor = scaling.factor
+            let lowFreqFactor = scaling.lowFreqFactor
+            let highFreqFactor = scaling.highFreqFactor
+            let oldContextLen = Float(scaling.originalMaxPositionEmbeddings)
+
+            let lowFreqWavelen = oldContextLen / lowFreqFactor
+            let highFreqWavelen = oldContextLen / highFreqFactor
+
+            for i in 0..<nPairs {
+                let wavelen = 2.0 * .pi / freqs[i]
+                if wavelen > lowFreqWavelen {
+                    // Low frequency: scale down
+                    freqs[i] /= factor
+                } else if wavelen >= highFreqWavelen {
+                    // Medium frequency: smooth interpolation
+                    let smooth = (oldContextLen / wavelen - lowFreqFactor) / (highFreqFactor - lowFreqFactor)
+                    freqs[i] = (1.0 - smooth) * freqs[i] / factor + smooth * freqs[i]
+                }
+                // High frequency (wavelen < highFreqWavelen): unchanged
+            }
+        }
+
+        let buf = MetalContext.shared.device.makeBuffer(bytes: freqs,
+                                                         length: nPairs * MemoryLayout<Float>.size,
+                                                         options: .storageModeShared)!
+        return buf
     }
 
     /// Compile the dynamic-RC decode kernel (R=1, any C). Called lazily on first decode.
@@ -72,24 +114,28 @@ public class LlamaModel: @unchecked Sendable {
     public func generate(prompt: [Int], maxTokens: Int = 256, temperature: Float = 0.7, topP: Float = 0.9, onToken: (Int, String) -> Bool) {
         cache.reset()
 
-        // Prefill: process all prompt tokens in one forward pass
+        // Prefill
         let lastLogits = prefill(tokenIds: prompt)
         cache.incrementPosition(by: prompt.count)
 
         // Decode
-        var nextToken = temperature > 0 ? sample(lastLogits, temperature: temperature, topP: topP) : argmax(lastLogits)
+        var generated: [Int] = []
+        var nextToken = temperature > 0 ? sample(lastLogits, temperature: temperature, topP: topP, previousTokens: prompt) : argmax(lastLogits)
         for _ in 0..<maxTokens {
             if !onToken(nextToken, "") { break }
+            generated.append(nextToken)
             let logits = forward(tokenId: nextToken, position: cache.currentLen)
             cache.incrementPosition()
-            nextToken = temperature > 0 ? sample(logits, temperature: temperature, topP: topP) : argmax(logits)
+            nextToken = temperature > 0 ? sample(logits, temperature: temperature, topP: topP, previousTokens: prompt + generated) : argmax(logits)
         }
     }
 
     /// Prefill: process all prompt tokens in one batched forward pass.
     /// Returns logits for the LAST token only (for next-token prediction).
     private func prefill(tokenIds: [Int]) -> Tensor {
-        MetalContext.shared.bufferPool.reset()
+        let ctx = MetalContext.shared
+        ctx.bufferPool.reset()
+        ctx.beginBatch()
         let seqLen = tokenIds.count
         let hidden = config.hiddenSize
 
@@ -102,7 +148,7 @@ public class LlamaModel: @unchecked Sendable {
             x = embeddingQ4Batch(weight: weight, scales: scales, biases: biases, tokenIds: tokenIds, K: K, groupSize: groupSize)
         }
 
-        let pool = MetalContext.shared.bufferPool
+        let pool = ctx.bufferPool
         for layer in 0..<config.numHiddenLayers {
             x = transformerBlockBatch(x, layer: layer, seqLen: seqLen, startPos: 0)
             pool.reset(keeping: [x.buffer])
@@ -111,15 +157,18 @@ public class LlamaModel: @unchecked Sendable {
         // Final norm on full [seqLen, hidden]
         x = rmsNorm(x, weight: weights.normWeight, eps: config.rmsNormEps, dim: hidden)
 
-        // LM head on last token only: extract [1, hidden] from [seqLen, hidden]
-        let lastRow = Tensor(buffer: x.buffer, shape: [1, hidden],
-                            offset: (seqLen - 1) * hidden * 4)
-        return linear(lastRow, weights.lmHead, M: 1, K: hidden, N: config.vocabSize, fast: useFlashAttention)
+        // LM head on last token only: GPU copy last row [1, hidden] from [seqLen, hidden]
+        let lastRow = gpuSlice(x.buffer, offsetBytes: (seqLen - 1) * hidden * 4, bytes: hidden * 4, shape: [1, hidden])
+        let logits = linear(lastRow, weights.lmHead, M: 1, K: hidden, N: config.vocabSize, fast: useFlashAttention)
+        ctx.endBatch()
+        return logits
     }
 
     /// Single-token forward pass (for decode after prefill).
     private func forward(tokenId: Int, position: Int) -> Tensor {
-        MetalContext.shared.bufferPool.reset()
+        let ctx = MetalContext.shared
+        ctx.bufferPool.reset()
+        ctx.beginBatch()
         var x: Tensor
         switch weights.embedTokens {
         case .float(let table):
@@ -128,14 +177,15 @@ public class LlamaModel: @unchecked Sendable {
             x = embeddingQ4(weight: weight, scales: scales, biases: biases, tokenId: tokenId, K: K, groupSize: groupSize)
         }
 
-        let pool = MetalContext.shared.bufferPool
+        // No pool.reset() between layers — buffers stay alive until endBatch().
+        // Decode (M=1) uses ~227KB/layer × 28 = ~6MB total. Safe.
         for layer in 0..<config.numHiddenLayers {
             x = transformerBlock(x, layer: layer, position: position)
-            pool.reset(keeping: [x.buffer])
         }
 
         x = rmsNorm(x, weight: weights.normWeight, eps: config.rmsNormEps, dim: config.hiddenSize)
         x = linear(x, weights.lmHead, M: 1, K: config.hiddenSize, N: config.vocabSize, fast: useFlashAttention)
+        ctx.endBatch()
         return x
     }
 
@@ -147,8 +197,6 @@ public class LlamaModel: @unchecked Sendable {
         let nHeads = config.numAttentionHeads
         let nKVHeads = config.numKeyValueHeads
         let headDim = config.headDim
-
-        // Self-attention
         let normed = rmsNorm(x, weight: w.inputNormWeight, eps: config.rmsNormEps, dim: hidden)
 
         // QKV projections: [seqLen, hidden] → [seqLen, nHeads*headDim]
@@ -160,8 +208,8 @@ public class LlamaModel: @unchecked Sendable {
         q = transposeSH(q, seqLen: seqLen, nHeads: nHeads, headDim: headDim)
         k = transposeSH(k, seqLen: seqLen, nHeads: nKVHeads, headDim: headDim)
 
-        q = rope(q, headDim: headDim, seqLen: seqLen, startPos: startPos, theta: config.ropeTheta)
-        k = rope(k, headDim: headDim, seqLen: seqLen, startPos: startPos, theta: config.ropeTheta)
+        q = rope(q, headDim: headDim, seqLen: seqLen, startPos: startPos, freqs: ropeFreqsBuf)
+        k = rope(k, headDim: headDim, seqLen: seqLen, startPos: startPos, freqs: ropeFreqsBuf)
 
         // Update KV cache with all tokens
         let kForCache = k
@@ -198,8 +246,8 @@ public class LlamaModel: @unchecked Sendable {
         let up = linear(normed2, w.upProj, M: seqLen, K: hidden, N: config.intermediateSize, fast: useFlashAttention)
         let activated = siluMul(gate, up)
         let down = linear(activated, w.downProj, M: seqLen, K: config.intermediateSize, N: hidden, fast: useFlashAttention)
-
-        return elemAdd(afterAttn, down)
+        let result = elemAdd(afterAttn, down)
+        return result
     }
 
     // MARK: - Single-token transformer block (decode)
@@ -216,8 +264,8 @@ public class LlamaModel: @unchecked Sendable {
         q = Tensor(buffer: q.buffer, shape: [config.numAttentionHeads, 1, config.headDim])
         k = Tensor(buffer: k.buffer, shape: [config.numKeyValueHeads, 1, config.headDim])
 
-        q = rope(q, headDim: config.headDim, seqLen: 1, startPos: position, theta: config.ropeTheta)
-        k = rope(k, headDim: config.headDim, seqLen: 1, startPos: position, theta: config.ropeTheta)
+        q = rope(q, headDim: config.headDim, seqLen: 1, startPos: position, freqs: ropeFreqsBuf)
+        k = rope(k, headDim: config.headDim, seqLen: 1, startPos: position, freqs: ropeFreqsBuf)
 
         let kForCache = Tensor(buffer: k.buffer, shape: [config.numKeyValueHeads, 1, config.headDim])
         let vForCache = Tensor(buffer: v.buffer, shape: [config.numKeyValueHeads, 1, config.headDim])
@@ -247,7 +295,6 @@ public class LlamaModel: @unchecked Sendable {
         let up = linear(normed2, w.upProj, M: 1, K: config.hiddenSize, N: config.intermediateSize, fast: useFlashAttention)
         let activated = siluMul(gate, up)
         let down = linear(activated, w.downProj, M: 1, K: config.intermediateSize, N: config.hiddenSize, fast: useFlashAttention)
-
         return elemAdd(afterAttn, down)
     }
 
@@ -279,9 +326,12 @@ public class LlamaModel: @unchecked Sendable {
         let pool = MetalContext.shared.bufferPool
         let oBytes = nHeads * R * headDim * 4
         let lBytes = nHeads * R * 4
-        let bufO = pool.get(length: oBytes); memset(bufO.contents(), 0, oBytes)
-        let bufL = pool.get(length: lBytes); memset(bufL.contents(), 0, lBytes)
-        let dummy = pool.get(length: 4); memset(dummy.contents(), 0, 4)
+        let bufO = pool.get(length: oBytes)
+        let bufL = pool.get(length: lBytes)
+        let dummy = pool.get(length: 16)  // min 16 bytes for uint4 fill
+        gpuZero(bufO, bytes: oBytes)
+        gpuZero(bufL, bytes: lBytes)
+        gpuZero(dummy, bytes: 16)
 
         let batchParams = AttentionKernel.createBatchedParamsBuffer(
             numHeads: UInt32(nHeads),
@@ -335,6 +385,35 @@ public class LlamaModel: @unchecked Sendable {
         }
         return Tensor(buffer: bufO, shape: [nHeads, R, headDim])
     }
+}
+
+// MARK: - GPU helpers
+
+/// Zero a Metal buffer on GPU (no CPU memset). Rounds up to 16-byte granularity.
+func gpuZero(_ buf: MTLBuffer, bytes: Int) {
+    let count16 = (bytes + 15) / 16  // uint4 = 16 bytes each
+    let pipe = KernelCache.shared.pipeline("fill_zero")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(buf, offset: 0, index: 0)
+        enc.dispatchThreads(MTLSize(width: count16, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: min(count16, 256), height: 1, depth: 1))
+    }
+}
+
+/// GPU slice: copy `bytes` from `src` at `offsetBytes` into a new pooled buffer.
+func gpuSlice(_ src: MTLBuffer, offsetBytes: Int, bytes: Int, shape: [Int]) -> Tensor {
+    let dst = MetalContext.shared.bufferPool.get(length: bytes)
+    let count16 = (bytes + 15) / 16
+    let pipe = KernelCache.shared.pipeline("copy_slice")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(src, offset: offsetBytes, index: 0)
+        enc.setBuffer(dst, offset: 0, index: 1)
+        enc.dispatchThreads(MTLSize(width: count16, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: min(count16, 256), height: 1, depth: 1))
+    }
+    return Tensor(buffer: dst, shape: shape)
 }
 
 // MARK: - CPU matmul fallback (for projections — will replace with GEMM kernel)

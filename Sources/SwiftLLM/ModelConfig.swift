@@ -15,6 +15,7 @@ public struct ModelConfig: Codable {
     public let headDim: Int
     public let tieWordEmbeddings: Bool
     public let quantization: QuantizationConfig?
+    public let ropeScaling: RopeScalingConfig?
 
     public struct QuantizationConfig: Codable {
         public let groupSize: Int
@@ -23,6 +24,22 @@ public struct ModelConfig: Codable {
         enum CodingKeys: String, CodingKey {
             case groupSize = "group_size"
             case bits
+        }
+    }
+
+    public struct RopeScalingConfig: Codable {
+        public let factor: Float
+        public let highFreqFactor: Float
+        public let lowFreqFactor: Float
+        public let originalMaxPositionEmbeddings: Int
+        public let ropeType: String
+
+        enum CodingKeys: String, CodingKey {
+            case factor
+            case highFreqFactor = "high_freq_factor"
+            case lowFreqFactor = "low_freq_factor"
+            case originalMaxPositionEmbeddings = "original_max_position_embeddings"
+            case ropeType = "rope_type"
         }
     }
 
@@ -39,6 +56,7 @@ public struct ModelConfig: Codable {
         case headDim = "head_dim"
         case tieWordEmbeddings = "tie_word_embeddings"
         case quantization
+        case ropeScaling = "rope_scaling"
     }
 
     public init(from url: URL) throws {
