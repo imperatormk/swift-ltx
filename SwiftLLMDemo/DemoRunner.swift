@@ -23,6 +23,7 @@ final class DemoRunner: ObservableObject {
     @Published var results: [GenerationResult] = []
     @Published var prompt = "Hello, who are you?"
     @Published var useFlashAttention = true
+    @Published var useFastGEMM = true
     @Published var temperature: Float = 0.7
     #if os(macOS)
     @Published var modelPath = "/Users/zimski/.cache/huggingface/hub/models--mlx-community--Llama-3.2-3B-Instruct-4bit/snapshots/7f0dc925e0d0afb0322d96f9255cfddf2ba5636e"
@@ -106,6 +107,7 @@ final class DemoRunner: ObservableObject {
         let url = modelURL
         let path = url?.path ?? modelPath
         let flash = useFlashAttention
+        let fastGemm = useFastGEMM
         let temp = temperature
         isRunning = true
         liveOutput = ""
@@ -115,13 +117,13 @@ final class DemoRunner: ObservableObject {
         let tokenizer = self.tokenizer
 
         Thread.detachNewThread { [weak self] in
-            self?.generateOnThread(text: text, path: path, flash: flash, temp: temp,
+            self?.generateOnThread(text: text, path: path, flash: flash, fastGemm: fastGemm, temp: temp,
                                    modelURL: url,
                                    existingModel: model, existingTokenizer: tokenizer)
         }
     }
 
-    private nonisolated func generateOnThread(text: String, path: String, flash: Bool, temp: Float,
+    private nonisolated func generateOnThread(text: String, path: String, flash: Bool, fastGemm: Bool, temp: Float,
                                                modelURL url: URL?,
                                                existingModel: LlamaModel?,
                                                existingTokenizer: Tokenizer?) {
@@ -165,6 +167,7 @@ final class DemoRunner: ObservableObject {
 
         guard let model, let tokenizer else { return }
         model.useFlashAttention = flash
+        model.useFastGEMM = fastGemm
 
         let tokens = tokenizer.chatTokens(for: text)
         var log = "prompt(\(tokens.count)): \(tokens)\n"
@@ -225,7 +228,7 @@ final class DemoRunner: ObservableObject {
         DispatchQueue.main.async { [weak self] in
             self?.results.insert(result, at: 0)
             self?.debugLog = finalLog
-            self?.statusText = String(format: "Done: prefill %.0f tok/s, decode %.1f tok/s, TTFT %.2fs", prefillTps, tps, ttft)
+            self?.statusText = String(format: "P:%.0f D:%.1f tok/s TTFT:%.2fs", prefillTps, tps, ttft)
             self?.isRunning = false
         }
     }

@@ -75,6 +75,19 @@ struct ContentView: View {
                         .tint(.cyan)
                         .disabled(runner.isRunning)
 
+                        // Fast GEMM toggle
+                        Toggle(isOn: $runner.useFastGEMM) {
+                            HStack(spacing: 6) {
+                                Image(systemName: runner.useFastGEMM ? "gauge.open.with.lines.needle.84percent.exclamation" : "gauge.open.with.lines.needle.33percent")
+                                    .foregroundStyle(runner.useFastGEMM ? .green : .gray)
+                                Text(runner.useFastGEMM ? "Fast GEMM" : "Default GEMM")
+                                    .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                                    .foregroundStyle(.white)
+                            }
+                        }
+                        .tint(.green)
+                        .disabled(runner.isRunning)
+
                         // Temperature slider
                         VStack(alignment: .leading, spacing: 4) {
                             HStack {

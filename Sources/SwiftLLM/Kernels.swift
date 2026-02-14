@@ -35,10 +35,11 @@ public final class KernelCache: @unchecked Sendable {
     // RMS Norm: out[i] = (x[i] / rms) * weight[i]
     // Parallel reduction across threads in threadgroup.
     // Grid: (rows) threadgroups, threadgroupSize threads each.
+    // Input/output f16, weight f32, accumulator f32.
     kernel void rms_norm(
-        device const float* x [[buffer(0)]],
+        device const half* x [[buffer(0)]],
         device const float* weight [[buffer(1)]],
-        device float* out [[buffer(2)]],
+        device half* out [[buffer(2)]],
         constant uint& dim [[buffer(3)]],
         constant float& eps [[buffer(4)]],
         uint tg_id [[threadgroup_position_in_grid]],
@@ -51,7 +52,7 @@ public final class KernelCache: @unchecked Sendable {
         // Parallel sum of squares
         float sum_sq = 0;
         for (uint i = tid_in_tg; i < dim; i += tg_size) {
-            float v = x[off + i];
+            float v = float(x[off + i]);
             sum_sq += v * v;
         }
 
@@ -79,37 +80,37 @@ public final class KernelCache: @unchecked Sendable {
 
         // Apply norm + weight in parallel
         for (uint i = tid_in_tg; i < dim; i += tg_size) {
-            out[off + i] = x[off + i] * rms * weight[i];
+            out[off + i] = half(float(x[off + i]) * rms * weight[i]);
         }
     }
 
     // Fused SiLU + element-wise multiply: out = silu(a) * b
     // Saves a kernel launch and memory round-trip.
     kernel void silu_mul(
-        device const float* a [[buffer(0)]],
-        device const float* b [[buffer(1)]],
-        device float* out [[buffer(2)]],
+        device const half* a [[buffer(0)]],
+        device const half* b [[buffer(1)]],
+        device half* out [[buffer(2)]],
         uint tid [[thread_position_in_grid]])
     {
-        float v = a[tid];
-        out[tid] = (v / (1.0f + exp(-v))) * b[tid];
+        float v = float(a[tid]);
+        out[tid] = half((v / (1.0f + exp(-v))) * float(b[tid]));
     }
 
     // SiLU (Swish): out = x * sigmoid(x) = x / (1 + exp(-x))
     kernel void silu(
-        device const float* x [[buffer(0)]],
-        device float* out [[buffer(1)]],
+        device const half* x [[buffer(0)]],
+        device half* out [[buffer(1)]],
         uint tid [[thread_position_in_grid]])
     {
-        float v = x[tid];
-        out[tid] = v / (1.0f + exp(-v));
+        float v = float(x[tid]);
+        out[tid] = half(v / (1.0f + exp(-v)));
     }
 
     // Element-wise multiply: out = a * b
     kernel void mul(
-        device const float* a [[buffer(0)]],
-        device const float* b [[buffer(1)]],
-        device float* out [[buffer(2)]],
+        device const half* a [[buffer(0)]],
+        device const half* b [[buffer(1)]],
+        device half* out [[buffer(2)]],
         uint tid [[thread_position_in_grid]])
     {
         out[tid] = a[tid] * b[tid];
@@ -117,9 +118,9 @@ public final class KernelCache: @unchecked Sendable {
 
     // Fused residual add: out = a + b (same as add, kept for clarity)
     kernel void add(
-        device const float* a [[buffer(0)]],
-        device const float* b [[buffer(1)]],
-        device float* out [[buffer(2)]],
+        device const half* a [[buffer(0)]],
+        device const half* b [[buffer(1)]],
+        device half* out [[buffer(2)]],
         uint tid [[thread_position_in_grid]])
     {
         out[tid] = a[tid] + b[tid];
@@ -128,8 +129,8 @@ public final class KernelCache: @unchecked Sendable {
     // Transpose [seqLen, nHeads, headDim] → [nHeads, seqLen, headDim]
     // Grid: (headDim, seqLen * nHeads)
     kernel void transpose_sh(
-        device const float* src [[buffer(0)]],
-        device float* dst [[buffer(1)]],
+        device const half* src [[buffer(0)]],
+        device half* dst [[buffer(1)]],
         constant uint& seqLen [[buffer(2)]],
         constant uint& nHeads [[buffer(3)]],
         constant uint& headDim [[buffer(4)]],
@@ -144,8 +145,8 @@ public final class KernelCache: @unchecked Sendable {
 
     // Transpose [nHeads, seqLen, headDim] → [seqLen, nHeads, headDim]
     kernel void transpose_hs(
-        device const float* src [[buffer(0)]],
-        device float* dst [[buffer(1)]],
+        device const half* src [[buffer(0)]],
+        device half* dst [[buffer(1)]],
         constant uint& seqLen [[buffer(2)]],
         constant uint& nHeads [[buffer(3)]],
         constant uint& headDim [[buffer(4)]],
@@ -160,9 +161,10 @@ public final class KernelCache: @unchecked Sendable {
 
     // RoPE (Rotary Position Embedding) with precomputed frequencies.
     // Uses half-dim split pairing: pair i rotates (x[i], x[i + D/2]).
+    // Input/output f16, freqs f32, trig computed in f32.
     kernel void rope(
-        device const float* src [[buffer(0)]],
-        device float* dst [[buffer(1)]],
+        device const half* src [[buffer(0)]],
+        device half* dst [[buffer(1)]],
         constant uint& headDim [[buffer(2)]],
         constant uint& startPos [[buffer(3)]],
         device const float* freqs [[buffer(4)]],
@@ -183,10 +185,10 @@ public final class KernelCache: @unchecked Sendable {
         float cos_a = cos(angle);
         float sin_a = sin(angle);
 
-        float x0 = src[idx0];
-        float x1 = src[idx1];
-        dst[idx0] = x0 * cos_a - x1 * sin_a;
-        dst[idx1] = x0 * sin_a + x1 * cos_a;
+        float x0 = float(src[idx0]);
+        float x1 = float(src[idx1]);
+        dst[idx0] = half(x0 * cos_a - x1 * sin_a);
+        dst[idx1] = half(x0 * sin_a + x1 * cos_a);
     }
 
     // Copy a contiguous slice from src to dst (uint4 = 16 bytes per thread).
@@ -209,8 +211,8 @@ public final class KernelCache: @unchecked Sendable {
     // KV cache append: copy [numKVHeads, seqLen, headDim] into strided [numKVHeads, maxSeqLen, headDim]
     // Grid: (headDim, numKVHeads * seqLen) threads
     kernel void kv_append(
-        device const float* src [[buffer(0)]],
-        device float* dst [[buffer(1)]],
+        device const half* src [[buffer(0)]],
+        device half* dst [[buffer(1)]],
         constant uint& headDim [[buffer(2)]],
         constant uint& seqLen [[buffer(3)]],
         constant uint& maxSeqLen [[buffer(4)]],
@@ -229,8 +231,8 @@ public final class KernelCache: @unchecked Sendable {
     // KV cache compact: copy strided [numKVHeads, maxSeqLen, headDim] → contiguous [numKVHeads, seqLen, headDim]
     // Grid: (headDim, numKVHeads * seqLen) threads
     kernel void kv_compact(
-        device const float* src [[buffer(0)]],
-        device float* dst [[buffer(1)]],
+        device const half* src [[buffer(0)]],
+        device half* dst [[buffer(1)]],
         constant uint& headDim [[buffer(2)]],
         constant uint& seqLen [[buffer(3)]],
         constant uint& maxSeqLen [[buffer(4)]],
@@ -265,24 +267,25 @@ public final class KernelCache: @unchecked Sendable {
     }
 
     // Batch embedding lookup: out[t * dim + i] = table[token_ids[t] * dim + i]
+    // Table stays f32 (weight data), output f16.
     kernel void embedding_batch(
         device const float* table [[buffer(0)]],
-        device float* out [[buffer(1)]],
+        device half* out [[buffer(1)]],
         device const uint* token_ids [[buffer(2)]],
         constant uint& dim [[buffer(3)]],
         uint2 tid [[thread_position_in_grid]])
     {
         uint i = tid.x;
         uint t = tid.y;
-        out[t * dim + i] = table[token_ids[t] * dim + i];
+        out[t * dim + i] = half(table[token_ids[t] * dim + i]);
     }
 
-    // Batch quantized embedding lookup
+    // Batch quantized embedding lookup — output f16.
     kernel void embedding_q4_batch(
         device const uint* weight [[buffer(0)]],
         device const half* scales [[buffer(1)]],
         device const half* biases [[buffer(2)]],
-        device float* out [[buffer(3)]],
+        device half* out [[buffer(3)]],
         device const uint* token_ids [[buffer(4)]],
         constant uint& K [[buffer(5)]],
         constant uint& group_size [[buffer(6)]],
@@ -304,26 +307,26 @@ public final class KernelCache: @unchecked Sendable {
         float scale = float(scales[token_id * groups_per_row + group_idx]);
         float bias = float(biases[token_id * groups_per_row + group_idx]);
 
-        out[t * K + k_idx] = float(nibble) * scale + bias;
+        out[t * K + k_idx] = half(float(nibble) * scale + bias);
     }
 
-    // Embedding lookup
+    // Embedding lookup — table f32, output f16.
     kernel void embedding(
         device const float* table [[buffer(0)]],
-        device float* out [[buffer(1)]],
+        device half* out [[buffer(1)]],
         constant uint& token_id [[buffer(2)]],
         constant uint& dim [[buffer(3)]],
         uint tid [[thread_position_in_grid]])
     {
-        out[tid] = table[token_id * dim + tid];
+        out[tid] = half(table[token_id * dim + tid]);
     }
 
-    // Quantized embedding lookup (4-bit)
+    // Quantized embedding lookup (4-bit) — output f16.
     kernel void embedding_q4(
         device const uint* weight [[buffer(0)]],
         device const half* scales [[buffer(1)]],
         device const half* biases [[buffer(2)]],
-        device float* out [[buffer(3)]],
+        device half* out [[buffer(3)]],
         constant uint& token_id [[buffer(4)]],
         constant uint& K [[buffer(5)]],
         constant uint& group_size [[buffer(6)]],
@@ -342,18 +345,19 @@ public final class KernelCache: @unchecked Sendable {
         float scale = float(scales[token_id * groups_per_row + group_idx]);
         float bias = float(biases[token_id * groups_per_row + group_idx]);
 
-        out[tid] = float(nibble) * scale + bias;
+        out[tid] = half(float(nibble) * scale + bias);
     }
 
     // Quantized matvec: out = x @ W^T where W is 4-bit quantized.
     // Each threadgroup computes one output row (one n).
     // Threads split work across K dimension with vectorized uint32 loads.
+    // Input x is f16, accumulator f32, output f16.
     kernel void matmul_q4(
-        device const float* x [[buffer(0)]],
+        device const half* x [[buffer(0)]],
         device const uint* weight [[buffer(1)]],
         device const half* scales [[buffer(2)]],
         device const half* biases [[buffer(3)]],
-        device float* out [[buffer(4)]],
+        device half* out [[buffer(4)]],
         constant uint& K [[buffer(5)]],
         constant uint& group_size [[buffer(6)]],
         constant uint& N [[buffer(7)]],
@@ -370,7 +374,7 @@ public final class KernelCache: @unchecked Sendable {
         // Vectorized: each thread processes 4 packed uint32s (32 weights) per iteration
         float sum = 0.0f;
         device const uint4* w_vec = (device const uint4*)(weight + n * packed_k);
-        device const float4* x_base = (device const float4*)(x + m * K);
+        device const half4* x_base = (device const half4*)(x + m * K);
 
         uint total_vec4 = packed_k / 4;
         for (uint vi = tid_in_tg; vi < total_vec4; vi += tg_size) {
@@ -388,18 +392,18 @@ public final class KernelCache: @unchecked Sendable {
                 uint packed_val = packs[pi];
                 uint k_off = p * 8;
 
-                // Unrolled 8-nibble extraction with float4 x loads
-                float4 xv0 = x_base[k_off / 4];
-                float4 xv1 = x_base[k_off / 4 + 1];
+                // Unrolled 8-nibble extraction with half4 x loads
+                half4 xv0 = x_base[k_off / 4];
+                half4 xv1 = x_base[k_off / 4 + 1];
 
-                sum += (float((packed_val      ) & 0xF) * scale + bias) * xv0.x;
-                sum += (float((packed_val >>  4) & 0xF) * scale + bias) * xv0.y;
-                sum += (float((packed_val >>  8) & 0xF) * scale + bias) * xv0.z;
-                sum += (float((packed_val >> 12) & 0xF) * scale + bias) * xv0.w;
-                sum += (float((packed_val >> 16) & 0xF) * scale + bias) * xv1.x;
-                sum += (float((packed_val >> 20) & 0xF) * scale + bias) * xv1.y;
-                sum += (float((packed_val >> 24) & 0xF) * scale + bias) * xv1.z;
-                sum += (float((packed_val >> 28) & 0xF) * scale + bias) * xv1.w;
+                sum += (float((packed_val      ) & 0xF) * scale + bias) * float(xv0.x);
+                sum += (float((packed_val >>  4) & 0xF) * scale + bias) * float(xv0.y);
+                sum += (float((packed_val >>  8) & 0xF) * scale + bias) * float(xv0.z);
+                sum += (float((packed_val >> 12) & 0xF) * scale + bias) * float(xv0.w);
+                sum += (float((packed_val >> 16) & 0xF) * scale + bias) * float(xv1.x);
+                sum += (float((packed_val >> 20) & 0xF) * scale + bias) * float(xv1.y);
+                sum += (float((packed_val >> 24) & 0xF) * scale + bias) * float(xv1.z);
+                sum += (float((packed_val >> 28) & 0xF) * scale + bias) * float(xv1.w);
             }
         }
 
@@ -413,7 +417,7 @@ public final class KernelCache: @unchecked Sendable {
             uint k_off = p * 8;
             for (uint s = 0; s < 8; s++) {
                 uint nibble = (packed_val >> (s * 4)) & 0xF;
-                sum += (float(nibble) * scale + bias) * x[m * K + k_off + s];
+                sum += (float(nibble) * scale + bias) * float(x[m * K + k_off + s]);
             }
         }
 
@@ -435,7 +439,7 @@ public final class KernelCache: @unchecked Sendable {
             float total = 0;
             uint num_simds = (tg_size + 31) / 32;
             for (uint i = 0; i < num_simds; i++) total += shared[i];
-            out[m * N + n] = total;
+            out[m * N + n] = half(total);
         }
     }
 
@@ -443,11 +447,12 @@ public final class KernelCache: @unchecked Sendable {
     // Q=[nHeads, R, D], K=[nKVHeads, C, D], V=[nKVHeads, C, D] → O=[nHeads, R, D]
     // Grid: (nHeads, R) threadgroups, D threads each.
     // params: [nHeads, nKVHeads, R, C, D, startPos]
+    // Input Q/K/V f16, accumulator f32, output O f16.
     kernel void naive_attention(
-        device const float* Q [[buffer(0)]],
-        device const float* K [[buffer(1)]],
-        device const float* V [[buffer(2)]],
-        device float* O [[buffer(3)]],
+        device const half* Q [[buffer(0)]],
+        device const half* K [[buffer(1)]],
+        device const half* V [[buffer(2)]],
+        device half* O [[buffer(3)]],
         constant uint* params [[buffer(4)]],
         uint2 tg_id [[threadgroup_position_in_grid]],
         uint tid_in_tg [[thread_index_in_threadgroup]],
@@ -482,7 +487,7 @@ public final class KernelCache: @unchecked Sendable {
         uint d_end = min(d_start + d_per_thread, D);
         uint d_count = (d_start < D) ? (d_end - d_start) : 0;
         for (uint i = 0; i < d_count && i < 4; i++) {
-            q_local[i] = Q[q_base + d_start + i];
+            q_local[i] = float(Q[q_base + d_start + i]);
         }
 
         uint simd_lane = tid_in_tg % 32;
@@ -512,7 +517,7 @@ public final class KernelCache: @unchecked Sendable {
         for (uint s = 0; s < causal_limit; s++) {
             float partial_dot = 0;
             for (uint i = 0; i < d_count && i < 4; i++) {
-                partial_dot += q_local[i] * K[kv_base + s * D + d_start + i];
+                partial_dot += q_local[i] * float(K[kv_base + s * D + d_start + i]);
             }
             REDUCE_DOT(partial_dot, dot)
             max_s = max(max_s, dot * scale);
@@ -524,13 +529,13 @@ public final class KernelCache: @unchecked Sendable {
         for (uint s = 0; s < causal_limit; s++) {
             float partial_dot = 0;
             for (uint i = 0; i < d_count && i < 4; i++) {
-                partial_dot += q_local[i] * K[kv_base + s * D + d_start + i];
+                partial_dot += q_local[i] * float(K[kv_base + s * D + d_start + i]);
             }
             REDUCE_DOT(partial_dot, dot2)
             float p = exp(dot2 * scale - max_s);
             sum_e += p;
             for (uint i = 0; i < d_count && i < 4; i++) {
-                o_acc[i] += p * V[kv_base + s * D + d_start + i];
+                o_acc[i] += p * float(V[kv_base + s * D + d_start + i]);
             }
         }
 
@@ -540,7 +545,7 @@ public final class KernelCache: @unchecked Sendable {
         float inv_sum = 1.0f / sum_e;
         uint o_base = h * R * D + r * D;
         for (uint i = 0; i < d_count && i < 4; i++) {
-            O[o_base + d_start + i] = o_acc[i] * inv_sum;
+            O[o_base + d_start + i] = half(o_acc[i] * inv_sum);
         }
     }
     """

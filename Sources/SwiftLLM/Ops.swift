@@ -7,7 +7,7 @@ import FlashAttention
 
 public func rmsNorm(_ x: Tensor, weight: Tensor, eps: Float, dim: Int) -> Tensor {
     let rows = x.count / dim
-    let out = Tensor.empty([rows, dim])
+    let out = Tensor.empty([rows, dim], dtype: .float16)
     let pipe = KernelCache.shared.pipeline("rms_norm")
 
     var d = UInt32(dim)
@@ -28,7 +28,7 @@ public func rmsNorm(_ x: Tensor, weight: Tensor, eps: Float, dim: Int) -> Tensor
 }
 
 public func silu(_ x: Tensor) -> Tensor {
-    let out = Tensor.empty(x.shape)
+    let out = Tensor.empty(x.shape, dtype: .float16)
     let pipe = KernelCache.shared.pipeline("silu")
     MetalContext.shared.run { enc in
         enc.setComputePipelineState(pipe)
@@ -42,7 +42,7 @@ public func silu(_ x: Tensor) -> Tensor {
 
 /// Fused SiLU(a) * b — saves a kernel launch and memory round-trip.
 public func siluMul(_ a: Tensor, _ b: Tensor) -> Tensor {
-    let out = Tensor.empty(a.shape)
+    let out = Tensor.empty(a.shape, dtype: .float16)
     let pipe = KernelCache.shared.pipeline("silu_mul")
     MetalContext.shared.run { enc in
         enc.setComputePipelineState(pipe)
@@ -56,7 +56,7 @@ public func siluMul(_ a: Tensor, _ b: Tensor) -> Tensor {
 }
 
 public func elemMul(_ a: Tensor, _ b: Tensor) -> Tensor {
-    let out = Tensor.empty(a.shape)
+    let out = Tensor.empty(a.shape, dtype: .float16)
     let pipe = KernelCache.shared.pipeline("mul")
     MetalContext.shared.run { enc in
         enc.setComputePipelineState(pipe)
@@ -70,7 +70,7 @@ public func elemMul(_ a: Tensor, _ b: Tensor) -> Tensor {
 }
 
 public func elemAdd(_ a: Tensor, _ b: Tensor) -> Tensor {
-    let out = Tensor.empty(a.shape)
+    let out = Tensor.empty(a.shape, dtype: .float16)
     let pipe = KernelCache.shared.pipeline("add")
     MetalContext.shared.run { enc in
         enc.setComputePipelineState(pipe)
@@ -84,7 +84,7 @@ public func elemAdd(_ a: Tensor, _ b: Tensor) -> Tensor {
 }
 
 public func embedding(table: Tensor, tokenId: Int, dim: Int) -> Tensor {
-    let out = Tensor.empty([dim])
+    let out = Tensor.empty([dim], dtype: .float16)
     var tid = UInt32(tokenId)
     var d = UInt32(dim)
     let pipe = KernelCache.shared.pipeline("embedding")
@@ -103,7 +103,7 @@ public func embedding(table: Tensor, tokenId: Int, dim: Int) -> Tensor {
 
 /// Transpose [seqLen, nHeads, headDim] → [nHeads, seqLen, headDim]
 public func transposeSH(_ x: Tensor, seqLen: Int, nHeads: Int, headDim: Int) -> Tensor {
-    let out = Tensor.empty([nHeads, seqLen, headDim])
+    let out = Tensor.empty([nHeads, seqLen, headDim], dtype: .float16)
     var sl = UInt32(seqLen), nh = UInt32(nHeads), hd = UInt32(headDim)
     let pipe = KernelCache.shared.pipeline("transpose_sh")
     MetalContext.shared.run { enc in
@@ -121,7 +121,7 @@ public func transposeSH(_ x: Tensor, seqLen: Int, nHeads: Int, headDim: Int) -> 
 
 /// Transpose [nHeads, seqLen, headDim] → [seqLen, nHeads, headDim]
 public func transposeHS(_ x: Tensor, seqLen: Int, nHeads: Int, headDim: Int) -> Tensor {
-    let out = Tensor.empty([seqLen, nHeads, headDim])
+    let out = Tensor.empty([seqLen, nHeads, headDim], dtype: .float16)
     var sl = UInt32(seqLen), nh = UInt32(nHeads), hd = UInt32(headDim)
     let pipe = KernelCache.shared.pipeline("transpose_hs")
     MetalContext.shared.run { enc in
@@ -140,7 +140,7 @@ public func transposeHS(_ x: Tensor, seqLen: Int, nHeads: Int, headDim: Int) -> 
 /// Batch embedding lookup: [numTokens] → [numTokens, dim]
 public func embeddingBatch(table: Tensor, tokenIds: [Int], dim: Int) -> Tensor {
     let n = tokenIds.count
-    let out = Tensor.empty([n, dim])
+    let out = Tensor.empty([n, dim], dtype: .float16)
     var ids = tokenIds.map { UInt32($0) }
     let ctx = MetalContext.shared
     let idsBuf = ctx.makePooledBuffer(&ids, length: n * 4)
@@ -162,7 +162,7 @@ public func embeddingBatch(table: Tensor, tokenIds: [Int], dim: Int) -> Tensor {
 /// Batch quantized embedding lookup: [numTokens] → [numTokens, K]
 public func embeddingQ4Batch(weight: Tensor, scales: Tensor, biases: Tensor, tokenIds: [Int], K: Int, groupSize: Int) -> Tensor {
     let n = tokenIds.count
-    let out = Tensor.empty([n, K])
+    let out = Tensor.empty([n, K], dtype: .float16)
     var ids = tokenIds.map { UInt32($0) }
     let ctx = MetalContext.shared
     let idsBuf = ctx.makePooledBuffer(&ids, length: n * 4)
@@ -186,7 +186,7 @@ public func embeddingQ4Batch(weight: Tensor, scales: Tensor, biases: Tensor, tok
 }
 
 public func embeddingQ4(weight: Tensor, scales: Tensor, biases: Tensor, tokenId: Int, K: Int, groupSize: Int) -> Tensor {
-    let out = Tensor.empty([K])
+    let out = Tensor.empty([K], dtype: .float16)
     var tid = UInt32(tokenId)
     var k = UInt32(K)
     var gs = UInt32(groupSize)
@@ -208,7 +208,7 @@ public func embeddingQ4(weight: Tensor, scales: Tensor, biases: Tensor, tokenId:
 }
 
 public func rope(_ x: Tensor, headDim: Int, seqLen: Int, startPos: Int, freqs: MTLBuffer) -> Tensor {
-    let out = Tensor.empty(x.shape)
+    let out = Tensor.empty(x.shape, dtype: .float16)
 
     var hd = UInt32(headDim)
     var p = UInt32(startPos)
@@ -235,9 +235,9 @@ public func rope(_ x: Tensor, headDim: Int, seqLen: Int, startPos: Int, freqs: M
 // MARK: - Quantized matmul (4-bit)
 
 /// Quantized matmul: out = x @ W^T where W is 4-bit packed.
-/// x: [M, K] float32. Returns [M, N] float32.
+/// x: [M, K] f16. Returns [M, N] f16.
 public func matmulQ4(_ x: Tensor, weight: Tensor, scales: Tensor, biases: Tensor, M: Int, K: Int, N: Int, groupSize: Int) -> Tensor {
-    let out = Tensor.empty([M, N])
+    let out = Tensor.empty([M, N], dtype: .float16)
     var k = UInt32(K)
     var gs = UInt32(groupSize)
     var n = UInt32(N)
@@ -263,21 +263,21 @@ public func matmulQ4(_ x: Tensor, weight: Tensor, scales: Tensor, biases: Tensor
 // MARK: - Fast quantized GEMM (monolithic IR)
 
 /// Fast quantized matmul via monolithic IR kernel.
-/// A: [M, K] f32 (input activations). W: [N, K/8] uint32 (packed weights).
-/// scales/biases: [N, K/groupSize] f16. Output: [M, N] f32.
+/// A: [M, K] f16 (input activations). W: [N, K/8] uint32 (packed weights).
+/// scales/biases: [N, K/groupSize] f16. Output: [M, N] f16.
 public func matmulQ4Fast(
     _ x: Tensor, weight: Tensor, scales: Tensor, biases: Tensor,
     M: Int, K: Int, N: Int, groupSize: Int
 ) -> Tensor {
     var gemmDesc = GEMMDescriptor()
     gemmDesc.matrixDimensions = (M: UInt32(M), N: UInt32(N), K: UInt32(K))
-    gemmDesc.memoryPrecisions = (A: .FP32, B: .FP16, C: .FP32)
+    gemmDesc.memoryPrecisions = (A: .FP16, B: .FP16, C: .FP16)
     gemmDesc.transposeState = (A: false, B: true)
     gemmDesc.quantizedB = true
     gemmDesc.groupSize = UInt32(groupSize)
 
     let (kernel, pipeline) = GEMMKernel.pipeline(for: gemmDesc)
-    let out = Tensor.empty([M, N])
+    let out = Tensor.empty([M, N], dtype: .float16)
 
     MetalContext.shared.run { enc in
         enc.setComputePipelineState(pipeline)
@@ -316,8 +316,21 @@ public func linear(_ x: Tensor, _ w: LinearWeight, M: Int, K: Int, N: Int, fast:
 
 // MARK: - Sampling
 
-/// Argmax over a float buffer (CPU — fine for vocab-sized vector).
+/// Argmax over a tensor (CPU — fine for vocab-sized vector). Supports f16 and f32.
 public func argmax(_ x: Tensor) -> Int {
+    if x.dtype == .float16 {
+        let ptr = x.buffer.contents().assumingMemoryBound(to: Float16.self)
+        var best = 0
+        var bestVal = Float(ptr[0])
+        for i in 1..<x.count {
+            let v = Float(ptr[i])
+            if v > bestVal {
+                bestVal = v
+                best = i
+            }
+        }
+        return best
+    }
     let ptr = x.buffer.contents().assumingMemoryBound(to: Float.self)
     var best = 0
     var bestVal = ptr[0]
@@ -332,11 +345,15 @@ public func argmax(_ x: Tensor) -> Int {
 
 /// Temperature sampling with top-p (nucleus) filtering and repetition penalty.
 public func sample(_ x: Tensor, temperature: Float = 0.7, topP: Float = 0.9, repetitionPenalty: Float = 1.1, previousTokens: [Int] = []) -> Int {
-    let ptr = x.buffer.contents().assumingMemoryBound(to: Float.self)
     let n = x.count
-
     var logits = [Float](repeating: 0, count: n)
-    for i in 0..<n { logits[i] = ptr[i] }
+    if x.dtype == .float16 {
+        let ptr = x.buffer.contents().assumingMemoryBound(to: Float16.self)
+        for i in 0..<n { logits[i] = Float(ptr[i]) }
+    } else {
+        let ptr = x.buffer.contents().assumingMemoryBound(to: Float.self)
+        for i in 0..<n { logits[i] = ptr[i] }
+    }
 
     // Apply repetition penalty to previously generated tokens
     for tok in previousTokens where tok < n {

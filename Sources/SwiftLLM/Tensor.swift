@@ -27,7 +27,7 @@ public struct Tensor {
     /// Create from existing Metal buffer with byte offset (copies the slice, uses pool).
     public init(buffer: MTLBuffer, shape: [Int], offset: Int, dtype: TensorDType = .float32) {
         let count = shape.reduce(1, *)
-        let bytes = count * 4  // float32
+        let bytes = count * dtype.size
         let buf = MetalContext.shared.bufferPool.get(length: bytes)
         memcpy(buf.contents(), buffer.contents() + offset, bytes)
         self.buffer = buf

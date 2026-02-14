@@ -25,7 +25,7 @@ public class KVCache {
         self.numLayers = numLayers
 
         let ctx = MetalContext.shared
-        let layerBytes = numKVHeads * maxSeqLen * headDim * 4  // float32
+        let layerBytes = numKVHeads * maxSeqLen * headDim * 2  // float16
         self.keyBuffers = (0..<numLayers).map { _ in ctx.makeBuffer(length: layerBytes) }
         self.valueBuffers = (0..<numLayers).map { _ in ctx.makeBuffer(length: layerBytes) }
         // One shared compact buffer pair — reused across layers (saves ~900MB)
@@ -96,7 +96,7 @@ public class KVCache {
                                threadsPerThreadgroup: MTLSize(width: min(self.headDim, 256), height: 1, depth: 1))
         }
 
-        return Tensor(buffer: out, shape: [numKVHeads, seqLen, headDim])
+        return Tensor(buffer: out, shape: [numKVHeads, seqLen, headDim], dtype: .float16)
     }
 
     public func reset() {
