@@ -202,37 +202,34 @@ public class LlamaModel: @unchecked Sendable {
         let normed = rmsNorm(x, weight: w.inputNormWeight, eps: config.rmsNormEps, dim: hidden)
 
         // QKV projections: [seqLen, hidden] → [seqLen, nHeads*headDim]
-        var q = linear(normed, w.qProj, M: seqLen, K: hidden, N: nHeads * headDim, fast: useFastGEMM)
-        var k = linear(normed, w.kProj, M: seqLen, K: hidden, N: nKVHeads * headDim, fast: useFastGEMM)
+        let qRaw = linear(normed, w.qProj, M: seqLen, K: hidden, N: nHeads * headDim, fast: useFastGEMM)
+        let kRaw = linear(normed, w.kProj, M: seqLen, K: hidden, N: nKVHeads * headDim, fast: useFastGEMM)
         let v = linear(normed, w.vProj, M: seqLen, K: hidden, N: nKVHeads * headDim, fast: useFastGEMM)
 
-        // Transpose [seqLen, nHeads*headDim] → [nHeads, seqLen, headDim] for RoPE
-        q = transposeSH(q, seqLen: seqLen, nHeads: nHeads, headDim: headDim)
-        k = transposeSH(k, seqLen: seqLen, nHeads: nKVHeads, headDim: headDim)
+        // Fused transpose + RoPE: [seqLen, nHeads*headDim] → [nHeads, seqLen, headDim] with rotation
+        let q = transposeSHRope(qRaw, seqLen: seqLen, nHeads: nHeads, headDim: headDim, startPos: startPos, freqs: ropeFreqsBuf)
+        let k = transposeSHRope(kRaw, seqLen: seqLen, nHeads: nKVHeads, headDim: headDim, startPos: startPos, freqs: ropeFreqsBuf)
 
-        q = rope(q, headDim: headDim, seqLen: seqLen, startPos: startPos, freqs: ropeFreqsBuf)
-        k = rope(k, headDim: headDim, seqLen: seqLen, startPos: startPos, freqs: ropeFreqsBuf)
-
-        // Update KV cache with all tokens
-        let kForCache = k
-        let vReshaped = transposeSH(v, seqLen: seqLen, nHeads: nKVHeads, headDim: headDim)
-        cache.append(layer: layer, k: kForCache, v: vReshaped, seqLen: seqLen)
+        // Update KV cache: K already transposed, V fused transpose+append
+        cache.appendFused(layer: layer, k: k, vTransposed: v, seqLen: seqLen)
 
         // For prefill: Q and K/V are the same tokens, C = seqLen
         let totalSeq = startPos + seqLen
         let attnOut: Tensor
         if useFlashAttention {
             attnOut = flashAttention(
-                q: q, k: cache.keys(layer: layer, seqLen: totalSeq),
-                v: cache.values(layer: layer, seqLen: totalSeq),
+                q: q, kBuf: cache.rawKeyBuffer(layer: layer),
+                vBuf: cache.rawValueBuffer(layer: layer),
                 R: seqLen, nHeads: nHeads, nKVHeads: nKVHeads,
-                seqLen: totalSeq, headDim: headDim)
+                seqLen: totalSeq, headDim: headDim,
+                maxSeqLen: cache.maxSeqLen)
         } else {
             attnOut = naiveAttention(
-                q: q, k: cache.keys(layer: layer, seqLen: totalSeq),
-                v: cache.values(layer: layer, seqLen: totalSeq),
+                q: q, kBuf: cache.rawKeyBuffer(layer: layer),
+                vBuf: cache.rawValueBuffer(layer: layer),
                 R: seqLen, nHeads: nHeads, nKVHeads: nKVHeads,
-                seqLen: totalSeq, headDim: headDim, startPos: startPos)
+                seqLen: totalSeq, headDim: headDim, startPos: startPos,
+                maxSeqLen: cache.maxSeqLen)
         }
 
         // Transpose [nHeads, seqLen, headDim] → [seqLen, nHeads*headDim] for O projection
@@ -240,10 +237,10 @@ public class LlamaModel: @unchecked Sendable {
         let attnFlatReshaped = Tensor(buffer: attnFlat.buffer, shape: [seqLen, nHeads * headDim], dtype: .float16)
         let attnProj = linear(attnFlatReshaped, w.oProj, M: seqLen, K: nHeads * headDim, N: hidden, fast: useFastGEMM)
 
-        let afterAttn = elemAdd(x, attnProj)
+        // Fused residual add + RMS norm at attn→FFN boundary
+        let (afterAttn, normed2) = residualRmsNorm(x, attnProj, weight: w.postNormWeight, eps: config.rmsNormEps, dim: hidden)
 
         // FFN (SwiGLU)
-        let normed2 = rmsNorm(afterAttn, weight: w.postNormWeight, eps: config.rmsNormEps, dim: hidden)
         let gate = linear(normed2, w.gateProj, M: seqLen, K: hidden, N: config.intermediateSize, fast: useFastGEMM)
         let up = linear(normed2, w.upProj, M: seqLen, K: hidden, N: config.intermediateSize, fast: useFastGEMM)
         let activated = siluMul(gate, up)
@@ -277,22 +274,25 @@ public class LlamaModel: @unchecked Sendable {
         let attnOut: Tensor
         if useFlashAttention {
             attnOut = flashAttention(
-                q: q, k: cache.keys(layer: layer, seqLen: seqLen), v: cache.values(layer: layer, seqLen: seqLen),
+                q: q, kBuf: cache.rawKeyBuffer(layer: layer),
+                vBuf: cache.rawValueBuffer(layer: layer),
                 R: 1, nHeads: config.numAttentionHeads, nKVHeads: config.numKeyValueHeads,
-                seqLen: seqLen, headDim: config.headDim)
+                seqLen: seqLen, headDim: config.headDim,
+                maxSeqLen: cache.maxSeqLen)
         } else {
             attnOut = naiveAttention(
-                q: q, k: cache.keys(layer: layer, seqLen: seqLen), v: cache.values(layer: layer, seqLen: seqLen),
+                q: q, kBuf: cache.rawKeyBuffer(layer: layer),
+                vBuf: cache.rawValueBuffer(layer: layer),
                 R: 1, nHeads: config.numAttentionHeads, nKVHeads: config.numKeyValueHeads,
-                seqLen: seqLen, headDim: config.headDim, startPos: seqLen - 1)
+                seqLen: seqLen, headDim: config.headDim, startPos: seqLen - 1,
+                maxSeqLen: cache.maxSeqLen)
         }
 
         let attnFlat = Tensor(buffer: attnOut.buffer, shape: [1, config.numAttentionHeads * config.headDim], dtype: .float16)
         let attnProj = linear(attnFlat, w.oProj, M: 1, K: config.numAttentionHeads * config.headDim, N: config.hiddenSize, fast: useFastGEMM)
 
-        let afterAttn = elemAdd(x, attnProj)
-
-        let normed2 = rmsNorm(afterAttn, weight: w.postNormWeight, eps: config.rmsNormEps, dim: config.hiddenSize)
+        // Fused residual add + RMS norm
+        let (afterAttn, normed2) = residualRmsNorm(x, attnProj, weight: w.postNormWeight, eps: config.rmsNormEps, dim: config.hiddenSize)
         let gate = linear(normed2, w.gateProj, M: 1, K: config.hiddenSize, N: config.intermediateSize, fast: useFastGEMM)
         let up = linear(normed2, w.upProj, M: 1, K: config.hiddenSize, N: config.intermediateSize, fast: useFastGEMM)
         let activated = siluMul(gate, up)
@@ -303,8 +303,9 @@ public class LlamaModel: @unchecked Sendable {
     // MARK: - Attention dispatch
 
     private func flashAttention(
-        q: Tensor, k: Tensor, v: Tensor,
-        R: Int, nHeads: Int, nKVHeads: Int, seqLen: Int, headDim: Int
+        q: Tensor, kBuf: MTLBuffer, vBuf: MTLBuffer,
+        R: Int, nHeads: Int, nKVHeads: Int, seqLen: Int, headDim: Int,
+        maxSeqLen: Int
     ) -> Tensor {
         let kernel: AttentionKernel
         let pipeline: MTLComputePipelineState
@@ -336,15 +337,34 @@ public class LlamaModel: @unchecked Sendable {
         gpuZero(bufL, bytes: lBytes)
         gpuZero(dummy, bytes: 16)
 
-        let batchParams = AttentionKernel.createBatchedParamsBuffer(
-            numHeads: UInt32(nHeads),
-            numKVHeads: UInt32(nKVHeads),
-            R: UInt32(R), C: UInt32(seqLen), D: UInt32(headDim))
+        // Custom BatchedParams with strided K/V (maxSeqLen stride between heads)
+        let kvRepeatFactor = UInt32(nHeads / nKVHeads)
+        let D = UInt32(headDim)
+        let kvStride = UInt32(maxSeqLen) * D  // strided cache: head stride = maxSeqLen * headDim
+        var params: [UInt32] = [
+            UInt32(nHeads),     // 0: numHeads
+            kvRepeatFactor,     // 1: kvRepeatFactor
+            UInt32(R) * D,      // 2: Q stride
+            kvStride,           // 3: K stride (maxSeqLen * headDim)
+            kvStride,           // 4: V stride (maxSeqLen * headDim)
+            UInt32(R) * D,      // 5: O stride
+            UInt32(R),          // 6: L stride
+            UInt32(R),          // 7: D stride
+            UInt32(R) * D,      // 8: dO stride
+            kvStride,           // 9: dV stride
+            kvStride,           // 10: dK stride
+            UInt32(R) * D,      // 11: dQ stride
+            0,                  // 12: causalOffset
+            UInt32(R),          // 13: R (dynamic)
+            UInt32(seqLen)      // 14: C (actual seqLen, not maxSeqLen)
+        ]
+        let batchParams = MetalContext.shared.device.makeBuffer(
+            bytes: &params, length: params.count * 4, options: .storageModeShared)!
 
         MetalContext.shared.run { enc in
             enc.setBuffer(q.buffer, offset: 0, index: 0)
-            enc.setBuffer(k.buffer, offset: 0, index: 1)
-            enc.setBuffer(v.buffer, offset: 0, index: 2)
+            enc.setBuffer(kBuf, offset: 0, index: 1)
+            enc.setBuffer(vBuf, offset: 0, index: 2)
             enc.setBuffer(bufO, offset: 0, index: 3)
             enc.setBuffer(bufL, offset: 0, index: 4)
             enc.setBuffer(dummy, offset: 0, index: 5)
@@ -367,19 +387,20 @@ public class LlamaModel: @unchecked Sendable {
     }
 
     private func naiveAttention(
-        q: Tensor, k: Tensor, v: Tensor,
-        R: Int, nHeads: Int, nKVHeads: Int, seqLen: Int, headDim: Int, startPos: Int
+        q: Tensor, kBuf: MTLBuffer, vBuf: MTLBuffer,
+        R: Int, nHeads: Int, nKVHeads: Int, seqLen: Int, headDim: Int, startPos: Int,
+        maxSeqLen: Int
     ) -> Tensor {
         let bufO = MetalContext.shared.bufferPool.get(length: nHeads * R * headDim * 2)  // f16
-        var params: [UInt32] = [UInt32(nHeads), UInt32(nKVHeads), UInt32(R), UInt32(seqLen), UInt32(headDim), UInt32(startPos)]
+        var params: [UInt32] = [UInt32(nHeads), UInt32(nKVHeads), UInt32(R), UInt32(seqLen), UInt32(headDim), UInt32(startPos), UInt32(maxSeqLen)]
         let paramBuf = MetalContext.shared.makePooledBuffer(&params, length: params.count * 4)
         let pipe = KernelCache.shared.pipeline("naive_attention")
 
         MetalContext.shared.run { enc in
             enc.setComputePipelineState(pipe)
             enc.setBuffer(q.buffer, offset: 0, index: 0)
-            enc.setBuffer(k.buffer, offset: 0, index: 1)
-            enc.setBuffer(v.buffer, offset: 0, index: 2)
+            enc.setBuffer(kBuf, offset: 0, index: 1)
+            enc.setBuffer(vBuf, offset: 0, index: 2)
             enc.setBuffer(bufO, offset: 0, index: 3)
             enc.setBuffer(paramBuf, offset: 0, index: 4)
             let tgSize = min(256, headDim)

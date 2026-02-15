@@ -232,18 +232,64 @@ public func rope(_ x: Tensor, headDim: Int, seqLen: Int, startPos: Int, freqs: M
     return out
 }
 
+/// Fused transpose [seqLen, nHeads, headDim] → [nHeads, seqLen, headDim] + RoPE.
+public func transposeSHRope(_ x: Tensor, seqLen: Int, nHeads: Int, headDim: Int, startPos: Int, freqs: MTLBuffer) -> Tensor {
+    let out = Tensor.empty([nHeads, seqLen, headDim], dtype: .float16)
+    var hd = UInt32(headDim), sl = UInt32(seqLen), nh = UInt32(nHeads), sp = UInt32(startPos)
+    let nPairs = headDim / 2
+    let pipe = KernelCache.shared.pipeline("transpose_sh_rope")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(x.buffer, offset: 0, index: 0)
+        enc.setBuffer(out.buffer, offset: 0, index: 1)
+        enc.setBytes(&hd, length: 4, index: 2)
+        enc.setBytes(&sl, length: 4, index: 3)
+        enc.setBytes(&nh, length: 4, index: 4)
+        enc.setBytes(&sp, length: 4, index: 5)
+        enc.setBuffer(freqs, offset: 0, index: 6)
+        enc.dispatchThreads(MTLSize(width: nPairs, height: seqLen * nHeads, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: min(nPairs, 32), height: 1, depth: 1))
+    }
+    return out
+}
+
+/// Fused residual add + RMS norm: computes residual = a + b, then norm = rms_norm(residual, weight).
+/// Returns (residual, norm) — both are needed downstream.
+public func residualRmsNorm(_ a: Tensor, _ b: Tensor, weight: Tensor, eps: Float, dim: Int) -> (residual: Tensor, normed: Tensor) {
+    let rows = a.count / dim
+    let residual = Tensor.empty([rows, dim], dtype: .float16)
+    let normed = Tensor.empty([rows, dim], dtype: .float16)
+    var d = UInt32(dim)
+    var e = eps
+    let pipe = KernelCache.shared.pipeline("residual_rms_norm")
+    let tgSize = min(dim, 256)
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(a.buffer, offset: 0, index: 0)
+        enc.setBuffer(b.buffer, offset: 0, index: 1)
+        enc.setBuffer(weight.buffer, offset: 0, index: 2)
+        enc.setBuffer(residual.buffer, offset: 0, index: 3)
+        enc.setBuffer(normed.buffer, offset: 0, index: 4)
+        enc.setBytes(&d, length: 4, index: 5)
+        enc.setBytes(&e, length: 4, index: 6)
+        enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
+    }
+    return (residual, normed)
+}
+
 // MARK: - Quantized matmul (4-bit)
 
 /// Quantized matmul: out = x @ W^T where W is 4-bit packed.
 /// x: [M, K] f16. Returns [M, N] f16.
 public func matmulQ4(_ x: Tensor, weight: Tensor, scales: Tensor, biases: Tensor, M: Int, K: Int, N: Int, groupSize: Int) -> Tensor {
     let out = Tensor.empty([M, N], dtype: .float16)
-    var k = UInt32(K)
-    var gs = UInt32(groupSize)
-    var n = UInt32(N)
+    var params: [UInt32] = [UInt32(K), UInt32(groupSize), UInt32(N), UInt32(M)]
     let pipe = KernelCache.shared.pipeline("matmul_q4")
 
-    let tgSize = 256
+    let rowsPerTG = 8  // 2 simdgroups × 4 rows
+    let tgSize = 64    // 2 simdgroups × 32 lanes
+    let totalTGs = (M * N + rowsPerTG - 1) / rowsPerTG
     MetalContext.shared.run { enc in
         enc.setComputePipelineState(pipe)
         enc.setBuffer(x.buffer, offset: 0, index: 0)
@@ -251,10 +297,8 @@ public func matmulQ4(_ x: Tensor, weight: Tensor, scales: Tensor, biases: Tensor
         enc.setBuffer(scales.buffer, offset: 0, index: 2)
         enc.setBuffer(biases.buffer, offset: 0, index: 3)
         enc.setBuffer(out.buffer, offset: 0, index: 4)
-        enc.setBytes(&k, length: 4, index: 5)
-        enc.setBytes(&gs, length: 4, index: 6)
-        enc.setBytes(&n, length: 4, index: 7)
-        enc.dispatchThreadgroups(MTLSize(width: M * N, height: 1, depth: 1),
+        enc.setBytes(&params, length: params.count * 4, index: 5)
+        enc.dispatchThreadgroups(MTLSize(width: totalTGs, height: 1, depth: 1),
                                 threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
     }
     return out

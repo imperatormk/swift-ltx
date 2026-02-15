@@ -191,6 +191,103 @@ public final class KernelCache: @unchecked Sendable {
         dst[idx1] = half(x0 * sin_a + x1 * cos_a);
     }
 
+    // Fused transpose [seqLen, nHeads, headDim] → [nHeads, seqLen, headDim] + RoPE.
+    // Reads from [s * nHeads * headDim + h * headDim + d], writes to [h * seqLen * headDim + s * headDim + d]
+    // with rotary embedding applied.
+    // Grid: (headDim/2, seqLen * nHeads)
+    kernel void transpose_sh_rope(
+        device const half* src [[buffer(0)]],
+        device half* dst [[buffer(1)]],
+        constant uint& headDim [[buffer(2)]],
+        constant uint& seqLen [[buffer(3)]],
+        constant uint& nHeads [[buffer(4)]],
+        constant uint& startPos [[buffer(5)]],
+        device const float* freqs [[buffer(6)]],
+        uint2 tid [[thread_position_in_grid]])
+    {
+        uint pair = tid.x;
+        uint idx = tid.y;
+        uint s = idx / nHeads;
+        uint h = idx % nHeads;
+
+        uint halfDim = headDim / 2;
+        uint position = startPos + s;
+
+        // Source indices: [seqLen, nHeads, headDim] layout
+        uint src_base = s * nHeads * headDim + h * headDim;
+        uint src0 = src_base + pair;
+        uint src1 = src_base + pair + halfDim;
+
+        // Dest indices: [nHeads, seqLen, headDim] layout
+        uint dst_base = h * seqLen * headDim + s * headDim;
+        uint dst0 = dst_base + pair;
+        uint dst1 = dst_base + pair + halfDim;
+
+        float freq = freqs[pair];
+        float angle = float(position) * freq;
+        float cos_a = cos(angle);
+        float sin_a = sin(angle);
+
+        float x0 = float(src[src0]);
+        float x1 = float(src[src1]);
+        dst[dst0] = half(x0 * cos_a - x1 * sin_a);
+        dst[dst1] = half(x0 * sin_a + x1 * cos_a);
+    }
+
+    // Fused residual add + RMS norm: out = rms_norm(a + b, weight)
+    // Saves a kernel launch and one memory round-trip for the intermediate sum.
+    // Grid: (rows) threadgroups, threadgroupSize threads each.
+    kernel void residual_rms_norm(
+        device const half* a [[buffer(0)]],
+        device const half* b [[buffer(1)]],
+        device const float* weight [[buffer(2)]],
+        device half* residual_out [[buffer(3)]],
+        device half* norm_out [[buffer(4)]],
+        constant uint& dim [[buffer(5)]],
+        constant float& eps [[buffer(6)]],
+        uint tg_id [[threadgroup_position_in_grid]],
+        uint tid_in_tg [[thread_index_in_threadgroup]],
+        uint tg_size [[threads_per_threadgroup]])
+    {
+        uint row = tg_id;
+        uint off = row * dim;
+
+        // Pass 1: compute a+b and sum of squares
+        float sum_sq = 0;
+        for (uint i = tid_in_tg; i < dim; i += tg_size) {
+            float v = float(a[off + i]) + float(b[off + i]);
+            residual_out[off + i] = half(v);
+            sum_sq += v * v;
+        }
+
+        // SIMD reduction
+        sum_sq += simd_shuffle_xor(sum_sq, 1);
+        sum_sq += simd_shuffle_xor(sum_sq, 2);
+        sum_sq += simd_shuffle_xor(sum_sq, 4);
+        sum_sq += simd_shuffle_xor(sum_sq, 8);
+        sum_sq += simd_shuffle_xor(sum_sq, 16);
+
+        threadgroup float shared[8];
+        uint simd_lane = tid_in_tg % 32;
+        uint simd_id = tid_in_tg / 32;
+        if (simd_lane == 0) shared[simd_id] = sum_sq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid_in_tg == 0) {
+            float total_sq = 0;
+            uint num_simds = (tg_size + 31) / 32;
+            for (uint i = 0; i < num_simds; i++) total_sq += shared[i];
+            shared[0] = rsqrt(total_sq / float(dim) + eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float rms = shared[0];
+
+        // Pass 2: apply norm + weight (read from residual_out to avoid recomputing a+b)
+        for (uint i = tid_in_tg; i < dim; i += tg_size) {
+            norm_out[off + i] = half(float(residual_out[off + i]) * rms * weight[i]);
+        }
+    }
+
     // Copy a contiguous slice from src to dst (uint4 = 16 bytes per thread).
     kernel void copy_slice(
         device const uint4* src [[buffer(0)]],
@@ -228,22 +325,28 @@ public final class KernelCache: @unchecked Sendable {
         dst[dst_off] = src[src_off];
     }
 
-    // KV cache compact: copy strided [numKVHeads, maxSeqLen, headDim] → contiguous [numKVHeads, seqLen, headDim]
-    // Grid: (headDim, numKVHeads * seqLen) threads
-    kernel void kv_compact(
+    // Fused transpose + KV cache append:
+    // Reads from [seqLen, nHeads, headDim], writes into strided [nHeads, maxSeqLen, headDim].
+    // Eliminates separate transpose_sh dispatch for V before kv_append.
+    // Grid: (headDim, nHeads * seqLen)
+    kernel void kv_append_transposed(
         device const half* src [[buffer(0)]],
         device half* dst [[buffer(1)]],
         constant uint& headDim [[buffer(2)]],
         constant uint& seqLen [[buffer(3)]],
         constant uint& maxSeqLen [[buffer(4)]],
+        constant uint& startPos [[buffer(5)]],
+        constant uint& nHeads [[buffer(6)]],
         uint2 tid [[thread_position_in_grid]])
     {
         uint d = tid.x;
         uint idx = tid.y;
         uint h = idx / seqLen;
         uint s = idx % seqLen;
-        uint src_off = h * maxSeqLen * headDim + s * headDim + d;
-        uint dst_off = h * seqLen * headDim + s * headDim + d;
+        // src layout: [seqLen, nHeads, headDim]
+        uint src_off = s * nHeads * headDim + h * headDim + d;
+        // dst layout: [nHeads, maxSeqLen, headDim]
+        uint dst_off = h * maxSeqLen * headDim + (startPos + s) * headDim + d;
         dst[dst_off] = src[src_off];
     }
 
@@ -349,104 +452,195 @@ public final class KernelCache: @unchecked Sendable {
     }
 
     // Quantized matvec: out = x @ W^T where W is 4-bit quantized.
-    // Each threadgroup computes one output row (one n).
-    // Threads split work across K dimension with vectorized uint32 loads.
+    // Inspired by MLX/llama.cpp: 2 simdgroups × 4 rows = 8 output rows per threadgroup.
+    // Each thread processes 2 packed uint32s (16 weights) per K-iteration.
+    // Uses MLX's delayed-division trick: pre-scale x, mask without shifting.
     // Input x is f16, accumulator f32, output f16.
+    //
+    // Grid: ceil(M * N / 8) threadgroups, 64 threads each.
+    // params: [K, group_size, N, M]
     kernel void matmul_q4(
         device const half* x [[buffer(0)]],
         device const uint* weight [[buffer(1)]],
         device const half* scales [[buffer(2)]],
         device const half* biases [[buffer(3)]],
         device half* out [[buffer(4)]],
-        constant uint& K [[buffer(5)]],
-        constant uint& group_size [[buffer(6)]],
-        constant uint& N [[buffer(7)]],
+        constant uint* params [[buffer(5)]],
         uint tg_id [[threadgroup_position_in_grid]],
         uint tid_in_tg [[thread_index_in_threadgroup]],
-        uint tg_size [[threads_per_threadgroup]])
+        uint simd_gid [[simdgroup_index_in_threadgroup]],
+        uint simd_lane [[thread_index_in_simdgroup]])
     {
-        uint n = tg_id % N;
-        uint m = tg_id / N;
+        constexpr uint NUM_SIMDGROUPS = 2;
+        constexpr uint ROWS_PER_SG = 4;
+        constexpr uint ROWS_PER_TG = NUM_SIMDGROUPS * ROWS_PER_SG;  // 8
+
+        uint K = params[0];
+        uint group_size = params[1];
+        uint N = params[2];
+        uint M = params[3];
+
         uint packed_k = K / 8;
         uint groups_per_row = K / group_size;
         uint packs_per_group = group_size / 8;
 
-        // Vectorized: each thread processes 4 packed uint32s (32 weights) per iteration
-        float sum = 0.0f;
-        device const uint4* w_vec = (device const uint4*)(weight + n * packed_k);
-        device const half4* x_base = (device const half4*)(x + m * K);
+        uint out_base = tg_id * ROWS_PER_TG;
+        uint total_out = M * N;
+        uint sg_row_base = out_base + simd_gid * ROWS_PER_SG;
 
-        uint total_vec4 = packed_k / 4;
-        for (uint vi = tid_in_tg; vi < total_vec4; vi += tg_size) {
-            uint4 packed4 = w_vec[vi];
-            uint p_base = vi * 4;
+        // Per-row: dot product accumulator and bias*sum_x accumulator
+        float sums[ROWS_PER_SG] = {0, 0, 0, 0};
+        float bias_sums[ROWS_PER_SG] = {0, 0, 0, 0};
 
-            // Process 4 packed uint32s = 32 weights
-            uint packs[4] = {packed4.x, packed4.y, packed4.z, packed4.w};
-            for (uint pi = 0; pi < 4; pi++) {
-                uint p = p_base + pi;
-                uint g = p / packs_per_group;
-                float scale = float(scales[n * groups_per_row + g]);
-                float bias = float(biases[n * groups_per_row + g]);
-
-                uint packed_val = packs[pi];
-                uint k_off = p * 8;
-
-                // Unrolled 8-nibble extraction with half4 x loads
-                half4 xv0 = x_base[k_off / 4];
-                half4 xv1 = x_base[k_off / 4 + 1];
-
-                sum += (float((packed_val      ) & 0xF) * scale + bias) * float(xv0.x);
-                sum += (float((packed_val >>  4) & 0xF) * scale + bias) * float(xv0.y);
-                sum += (float((packed_val >>  8) & 0xF) * scale + bias) * float(xv0.z);
-                sum += (float((packed_val >> 12) & 0xF) * scale + bias) * float(xv0.w);
-                sum += (float((packed_val >> 16) & 0xF) * scale + bias) * float(xv1.x);
-                sum += (float((packed_val >> 20) & 0xF) * scale + bias) * float(xv1.y);
-                sum += (float((packed_val >> 24) & 0xF) * scale + bias) * float(xv1.z);
-                sum += (float((packed_val >> 28) & 0xF) * scale + bias) * float(xv1.w);
-            }
+        // Precompute (m, n) for each row in this simdgroup
+        uint row_n[ROWS_PER_SG];
+        uint row_m[ROWS_PER_SG];
+        uint valid_rows = 0;
+        for (uint ri = 0; ri < ROWS_PER_SG; ri++) {
+            uint out_idx = sg_row_base + ri;
+            if (out_idx >= total_out) break;
+            row_n[ri] = out_idx % N;
+            row_m[ri] = out_idx / N;
+            valid_rows = ri + 1;
         }
 
-        // Handle remainder (packed_k not multiple of 4)
-        uint remainder_start = total_vec4 * 4;
-        for (uint p = remainder_start + tid_in_tg; p < packed_k; p += tg_size) {
-            uint g = p / packs_per_group;
-            float scale = float(scales[n * groups_per_row + g]);
-            float bias = float(biases[n * groups_per_row + g]);
-            uint packed_val = weight[n * packed_k + p];
-            uint k_off = p * 8;
-            for (uint s = 0; s < 8; s++) {
-                uint nibble = (packed_val >> (s * 4)) & 0xF;
-                sum += (float(nibble) * scale + bias) * float(x[m * K + k_off + s]);
+        // 4 packs per lane per iteration = 32 weights, stride 128 packs across 32 lanes
+        for (uint p_base = simd_lane * 4; p_base < packed_k; p_base += 128) {
+            uint k_off = p_base * 8;
+
+            // Load 32 x values for m=0 (decode common case)
+            device const half* x_ptr = x + k_off;
+            half4 xv[8];
+            xv[0] = *((device const half4*)(x_ptr));
+            xv[1] = *((device const half4*)(x_ptr + 4));
+            xv[2] = *((device const half4*)(x_ptr + 8));
+            xv[3] = *((device const half4*)(x_ptr + 12));
+            xv[4] = *((device const half4*)(x_ptr + 16));
+            xv[5] = *((device const half4*)(x_ptr + 20));
+            xv[6] = *((device const half4*)(x_ptr + 24));
+            xv[7] = *((device const half4*)(x_ptr + 28));
+
+            // sum_x per pack for bias factoring
+            float sum_x0 = float(xv[0].x) + float(xv[0].y) + float(xv[0].z) + float(xv[0].w)
+                         + float(xv[1].x) + float(xv[1].y) + float(xv[1].z) + float(xv[1].w);
+            float sum_x1 = float(xv[2].x) + float(xv[2].y) + float(xv[2].z) + float(xv[2].w)
+                         + float(xv[3].x) + float(xv[3].y) + float(xv[3].z) + float(xv[3].w);
+            float sum_x2 = float(xv[4].x) + float(xv[4].y) + float(xv[4].z) + float(xv[4].w)
+                         + float(xv[5].x) + float(xv[5].y) + float(xv[5].z) + float(xv[5].w);
+            float sum_x3 = float(xv[6].x) + float(xv[6].y) + float(xv[6].z) + float(xv[6].w)
+                         + float(xv[7].x) + float(xv[7].y) + float(xv[7].z) + float(xv[7].w);
+
+            for (uint ri = 0; ri < valid_rows; ri++) {
+                uint n = row_n[ri];
+                uint m = row_m[ri];
+
+                if (m > 0) {
+                    device const half* mx_ptr = x + m * K + k_off;
+                    xv[0] = *((device const half4*)(mx_ptr));
+                    xv[1] = *((device const half4*)(mx_ptr + 4));
+                    xv[2] = *((device const half4*)(mx_ptr + 8));
+                    xv[3] = *((device const half4*)(mx_ptr + 12));
+                    xv[4] = *((device const half4*)(mx_ptr + 16));
+                    xv[5] = *((device const half4*)(mx_ptr + 20));
+                    xv[6] = *((device const half4*)(mx_ptr + 24));
+                    xv[7] = *((device const half4*)(mx_ptr + 28));
+                    sum_x0 = float(xv[0].x) + float(xv[0].y) + float(xv[0].z) + float(xv[0].w)
+                           + float(xv[1].x) + float(xv[1].y) + float(xv[1].z) + float(xv[1].w);
+                    sum_x1 = float(xv[2].x) + float(xv[2].y) + float(xv[2].z) + float(xv[2].w)
+                           + float(xv[3].x) + float(xv[3].y) + float(xv[3].z) + float(xv[3].w);
+                    sum_x2 = float(xv[4].x) + float(xv[4].y) + float(xv[4].z) + float(xv[4].w)
+                           + float(xv[5].x) + float(xv[5].y) + float(xv[5].z) + float(xv[5].w);
+                    sum_x3 = float(xv[6].x) + float(xv[6].y) + float(xv[6].z) + float(xv[6].w)
+                           + float(xv[7].x) + float(xv[7].y) + float(xv[7].z) + float(xv[7].w);
+                }
+
+                device const uint* w_row = weight + n * packed_k;
+                uint scale_base = n * groups_per_row;
+                uint bias_base = n * groups_per_row;
+
+                // Pack 0
+                uint g0 = p_base / packs_per_group;
+                float s0 = float(scales[scale_base + g0]);
+                uint pv0 = w_row[p_base];
+                sums[ri] += float((pv0      ) & 0xF) * s0 * float(xv[0].x);
+                sums[ri] += float((pv0 >>  4) & 0xF) * s0 * float(xv[0].y);
+                sums[ri] += float((pv0 >>  8) & 0xF) * s0 * float(xv[0].z);
+                sums[ri] += float((pv0 >> 12) & 0xF) * s0 * float(xv[0].w);
+                sums[ri] += float((pv0 >> 16) & 0xF) * s0 * float(xv[1].x);
+                sums[ri] += float((pv0 >> 20) & 0xF) * s0 * float(xv[1].y);
+                sums[ri] += float((pv0 >> 24) & 0xF) * s0 * float(xv[1].z);
+                sums[ri] += float((pv0 >> 28)      ) * s0 * float(xv[1].w);
+
+                // Pack 1
+                uint g1 = (p_base + 1) / packs_per_group;
+                float s1 = float(scales[scale_base + g1]);
+                uint pv1 = w_row[p_base + 1];
+                sums[ri] += float((pv1      ) & 0xF) * s1 * float(xv[2].x);
+                sums[ri] += float((pv1 >>  4) & 0xF) * s1 * float(xv[2].y);
+                sums[ri] += float((pv1 >>  8) & 0xF) * s1 * float(xv[2].z);
+                sums[ri] += float((pv1 >> 12) & 0xF) * s1 * float(xv[2].w);
+                sums[ri] += float((pv1 >> 16) & 0xF) * s1 * float(xv[3].x);
+                sums[ri] += float((pv1 >> 20) & 0xF) * s1 * float(xv[3].y);
+                sums[ri] += float((pv1 >> 24) & 0xF) * s1 * float(xv[3].z);
+                sums[ri] += float((pv1 >> 28)      ) * s1 * float(xv[3].w);
+
+                // Pack 2
+                uint g2 = (p_base + 2) / packs_per_group;
+                float s2 = float(scales[scale_base + g2]);
+                uint pv2 = w_row[p_base + 2];
+                sums[ri] += float((pv2      ) & 0xF) * s2 * float(xv[4].x);
+                sums[ri] += float((pv2 >>  4) & 0xF) * s2 * float(xv[4].y);
+                sums[ri] += float((pv2 >>  8) & 0xF) * s2 * float(xv[4].z);
+                sums[ri] += float((pv2 >> 12) & 0xF) * s2 * float(xv[4].w);
+                sums[ri] += float((pv2 >> 16) & 0xF) * s2 * float(xv[5].x);
+                sums[ri] += float((pv2 >> 20) & 0xF) * s2 * float(xv[5].y);
+                sums[ri] += float((pv2 >> 24) & 0xF) * s2 * float(xv[5].z);
+                sums[ri] += float((pv2 >> 28)      ) * s2 * float(xv[5].w);
+
+                // Pack 3
+                uint g3 = (p_base + 3) / packs_per_group;
+                float s3 = float(scales[scale_base + g3]);
+                uint pv3 = w_row[p_base + 3];
+                sums[ri] += float((pv3      ) & 0xF) * s3 * float(xv[6].x);
+                sums[ri] += float((pv3 >>  4) & 0xF) * s3 * float(xv[6].y);
+                sums[ri] += float((pv3 >>  8) & 0xF) * s3 * float(xv[6].z);
+                sums[ri] += float((pv3 >> 12) & 0xF) * s3 * float(xv[6].w);
+                sums[ri] += float((pv3 >> 16) & 0xF) * s3 * float(xv[7].x);
+                sums[ri] += float((pv3 >> 20) & 0xF) * s3 * float(xv[7].y);
+                sums[ri] += float((pv3 >> 24) & 0xF) * s3 * float(xv[7].z);
+                sums[ri] += float((pv3 >> 28)      ) * s3 * float(xv[7].w);
+
+                // Bias: once per pack instead of 8 times
+                float b0 = float(biases[bias_base + g0]);
+                float b1 = float(biases[bias_base + g1]);
+                float b2 = float(biases[bias_base + g2]);
+                float b3 = float(biases[bias_base + g3]);
+                bias_sums[ri] += b0 * sum_x0 + b1 * sum_x1 + b2 * sum_x2 + b3 * sum_x3;
             }
         }
 
         // SIMD reduction
-        sum += simd_shuffle_xor(sum, 1);
-        sum += simd_shuffle_xor(sum, 2);
-        sum += simd_shuffle_xor(sum, 4);
-        sum += simd_shuffle_xor(sum, 8);
-        sum += simd_shuffle_xor(sum, 16);
+        for (uint ri = 0; ri < ROWS_PER_SG; ri++) {
+            sums[ri] += bias_sums[ri];
+            sums[ri] += simd_shuffle_xor(sums[ri], 1);
+            sums[ri] += simd_shuffle_xor(sums[ri], 2);
+            sums[ri] += simd_shuffle_xor(sums[ri], 4);
+            sums[ri] += simd_shuffle_xor(sums[ri], 8);
+            sums[ri] += simd_shuffle_xor(sums[ri], 16);
+        }
 
-        // Cross-SIMD reduction
-        threadgroup float shared[8];
-        uint simd_lane = tid_in_tg % 32;
-        uint simd_id = tid_in_tg / 32;
-        if (simd_lane == 0) shared[simd_id] = sum;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (tid_in_tg == 0) {
-            float total = 0;
-            uint num_simds = (tg_size + 31) / 32;
-            for (uint i = 0; i < num_simds; i++) total += shared[i];
-            out[m * N + n] = half(total);
+        if (simd_lane == 0) {
+            for (uint ri = 0; ri < valid_rows; ri++) {
+                uint out_idx = sg_row_base + ri;
+                out[out_idx] = half(sums[ri]);
+            }
         }
     }
 
     // Naive GPU attention with causal mask — parallelized across D dimension.
-    // Q=[nHeads, R, D], K=[nKVHeads, C, D], V=[nKVHeads, C, D] → O=[nHeads, R, D]
+    // Q=[nHeads, R, D], K/V=[nKVHeads, maxSeqLen, D] (strided cache, first C rows valid)
     // Grid: (nHeads, R) threadgroups, D threads each.
-    // params: [nHeads, nKVHeads, R, C, D, startPos]
+    // params: [nHeads, nKVHeads, R, C, D, startPos, maxSeqLen]
     // Input Q/K/V f16, accumulator f32, output O f16.
     kernel void naive_attention(
         device const half* Q [[buffer(0)]],
@@ -467,6 +661,7 @@ public final class KernelCache: @unchecked Sendable {
         uint C = params[3];
         uint D = params[4];
         uint startPos = params[5];
+        uint maxSeqLen = params[6];
         uint kvRepeat = nHeads / nKVHeads;
         uint kvh = h / kvRepeat;
 
@@ -474,7 +669,7 @@ public final class KernelCache: @unchecked Sendable {
         float scale = rsqrt(float(D));
 
         uint q_base = h * R * D + r * D;
-        uint kv_base = kvh * C * D;
+        uint kv_base = kvh * maxSeqLen * D;
 
         // Shared memory for reductions (must be at function scope)
         threadgroup float tg_reduce[8];
