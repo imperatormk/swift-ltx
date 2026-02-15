@@ -144,32 +144,63 @@ public struct Tokenizer: Sendable {
 
     /// Wrap user text in Llama 3 chat template tokens.
     public func chatTokens(for text: String) -> [Int] {
+        return chatTokens(for: [("user", text)])
+    }
+
+    /// Multi-turn chat tokenization. Each message is (role, content).
+    /// Returns the full token sequence including system prompt.
+    public func chatTokens(for messages: [(role: String, content: String)]) -> [Int] {
         if startHeaderId >= 0 {
-            // Llama 3 format with system prompt
             let nl = encode("\n\n")
             let system = encode("system")
             let systemMsg = encode("Cutting Knowledge Date: December 2023\nToday Date: 14 Feb 2026\n\nYou are a helpful assistant.")
-            let user = encode("user")
-            let userText = encode(text)
-            let assistant = encode("assistant")
+
             var result = [bosToken, startHeaderId]
             result += system
             result += [endHeaderId]
             result += nl
             result += systemMsg
+
+            for msg in messages {
+                result += [eotId, startHeaderId]
+                result += encode(msg.role)
+                result += [endHeaderId]
+                result += nl
+                result += encode(msg.content)
+            }
+
+            // End with assistant header for generation
             result += [eotId, startHeaderId]
-            result += user
-            result += [endHeaderId]
-            result += nl
-            result += userText
-            result += [eotId, startHeaderId]
-            result += assistant
+            result += encode("assistant")
             result += [endHeaderId]
             result += nl
             return result
         } else {
-            // Fallback: just BOS + text
-            return [bosToken] + encode(text)
+            var result = [bosToken]
+            for msg in messages {
+                result += encode(msg.content)
+            }
+            return result
+        }
+    }
+
+    /// Tokenize only the continuation after previous cached tokens.
+    /// Produces: [eot] [header:user] content [eot] [header:assistant] \n\n
+    public func continuationTokens(userMessage: String) -> [Int] {
+        if startHeaderId >= 0 {
+            let nl = encode("\n\n")
+            var result = [eotId, startHeaderId]
+            result += encode("user")
+            result += [endHeaderId]
+            result += nl
+            result += encode(userMessage)
+            result += [eotId, startHeaderId]
+            result += encode("assistant")
+            result += [endHeaderId]
+            result += nl
+            return result
+        } else {
+            return encode(userMessage)
         }
     }
 

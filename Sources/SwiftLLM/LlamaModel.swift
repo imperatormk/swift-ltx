@@ -113,28 +113,59 @@ public class LlamaModel: @unchecked Sendable {
     }
 
     /// Generate tokens autoregressively.
+    /// Current cache position (tokens already processed).
+    public var cachePosition: Int { cache.currentLen }
+
+    /// Max supported sequence length.
+    public var maxSeqLen: Int { cache.maxSeqLen }
+
+    /// Reset conversation state (call when starting a new chat).
+    public func resetCache() { cache.reset() }
+
     public func generate(prompt: [Int], maxTokens: Int = 256, temperature: Float = 0.7, topP: Float = 0.9, onToken: (Int, String) -> Bool) {
-        cache.reset()
+        generate(prompt: prompt, maxTokens: maxTokens, temperature: temperature, topP: topP, continueFrom: 0, onToken: onToken)
+    }
 
-        // Prefill
-        let lastLogits = prefill(tokenIds: prompt)
-        cache.incrementPosition(by: prompt.count)
+    /// Generate with KV cache continuation.
+    /// `continueFrom` = number of tokens already in cache from previous turns.
+    /// Only prefills tokens[continueFrom...] (the new part).
+    public func generate(prompt: [Int], maxTokens: Int = 256, temperature: Float = 0.7, topP: Float = 0.9,
+                         continueFrom: Int = 0, onToken: (Int, String) -> Bool) {
+        if continueFrom == 0 {
+            cache.reset()
+        }
 
-        // Decode
+        // Guard against exceeding KV cache
+        let totalNeeded = prompt.count + maxTokens
+        let effectiveMaxTokens = min(maxTokens, cache.maxSeqLen - prompt.count)
+        guard effectiveMaxTokens > 0 else { return }
+
+        // Only prefill new tokens (after continueFrom)
+        let newTokens = Array(prompt[continueFrom...])
+        guard !newTokens.isEmpty else { return }
+
+        let lastLogits = prefill(tokenIds: newTokens, startPos: continueFrom)
+        cache.incrementPosition(by: newTokens.count)
+
+        // Decode with Set-based repetition tracking
+        var seenTokens = Set(prompt)
         var generated: [Int] = []
-        var nextToken = temperature > 0 ? sample(lastLogits, temperature: temperature, topP: topP, previousTokens: prompt) : argmax(lastLogits)
-        for _ in 0..<maxTokens {
+        var nextToken = temperature > 0 ? sample(lastLogits, temperature: temperature, topP: topP, seenTokens: seenTokens) : argmax(lastLogits)
+        for _ in 0..<effectiveMaxTokens {
             if !onToken(nextToken, "") { break }
             generated.append(nextToken)
+            seenTokens.insert(nextToken)
+            guard cache.currentLen < cache.maxSeqLen else { break }
             let logits = forward(tokenId: nextToken, position: cache.currentLen)
             cache.incrementPosition()
-            nextToken = temperature > 0 ? sample(logits, temperature: temperature, topP: topP, previousTokens: prompt + generated) : argmax(logits)
+            nextToken = temperature > 0 ? sample(logits, temperature: temperature, topP: topP, seenTokens: seenTokens) : argmax(logits)
         }
     }
 
     /// Prefill: process all prompt tokens in one batched forward pass.
     /// Returns logits for the LAST token only (for next-token prediction).
-    private func prefill(tokenIds: [Int]) -> Tensor {
+    /// `startPos` is the KV cache position where these tokens start (for continuation).
+    private func prefill(tokenIds: [Int], startPos: Int = 0) -> Tensor {
         let ctx = MetalContext.shared
         ctx.bufferPool.reset()
         ctx.beginBatch()
@@ -152,7 +183,7 @@ public class LlamaModel: @unchecked Sendable {
 
         let pool = ctx.bufferPool
         for layer in 0..<config.numHiddenLayers {
-            x = transformerBlockBatch(x, layer: layer, seqLen: seqLen, startPos: 0)
+            x = transformerBlockBatch(x, layer: layer, seqLen: seqLen, startPos: startPos)
             pool.reset(keeping: [x.buffer])
         }
 
@@ -222,7 +253,7 @@ public class LlamaModel: @unchecked Sendable {
                 vBuf: cache.rawValueBuffer(layer: layer),
                 R: seqLen, nHeads: nHeads, nKVHeads: nKVHeads,
                 seqLen: totalSeq, headDim: headDim,
-                maxSeqLen: cache.maxSeqLen)
+                maxSeqLen: cache.maxSeqLen, startPos: startPos)
         } else {
             attnOut = naiveAttention(
                 q: q, kBuf: cache.rawKeyBuffer(layer: layer),
@@ -305,7 +336,7 @@ public class LlamaModel: @unchecked Sendable {
     private func flashAttention(
         q: Tensor, kBuf: MTLBuffer, vBuf: MTLBuffer,
         R: Int, nHeads: Int, nKVHeads: Int, seqLen: Int, headDim: Int,
-        maxSeqLen: Int
+        maxSeqLen: Int, startPos: Int = 0
     ) -> Tensor {
         let kernel: AttentionKernel
         let pipeline: MTLComputePipelineState
@@ -354,7 +385,7 @@ public class LlamaModel: @unchecked Sendable {
             kvStride,           // 9: dV stride
             kvStride,           // 10: dK stride
             UInt32(R) * D,      // 11: dQ stride
-            0,                  // 12: causalOffset
+            UInt32(startPos),    // 12: causalOffset
             UInt32(R),          // 13: R (dynamic)
             UInt32(seqLen)      // 14: C (actual seqLen, not maxSeqLen)
         ]

@@ -129,4 +129,9 @@ public final class BufferPool: @unchecked Sendable {
         active.removeAll(keepingCapacity: true)
         active.append(contentsOf: keeping)
     }
+
+    /// Purge free lists to actually release GPU memory.
+    public func purge() {
+        free.removeAll()
+    }
 }

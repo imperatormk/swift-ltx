@@ -4,3 +4,4 @@ DerivedData/
 *.xcuserstate
 xcuserdata/
 Package.resolved
+*.txt

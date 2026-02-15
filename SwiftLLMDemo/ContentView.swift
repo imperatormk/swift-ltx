@@ -228,6 +228,12 @@ struct ContentView: View {
                         .buttonStyle(.borderedProminent)
                         .tint(.red)
                     } else {
+                        Button(action: { runner.clearChat() }) {
+                            Image(systemName: "trash")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.gray)
+
                         Button(action: { runner.run() }) {
                             Image(systemName: "play.fill")
                         }
