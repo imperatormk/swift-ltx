@@ -122,54 +122,79 @@ public class LatentUpsampler {
 // MARK: - AdaIN
 
 /// AdaIN f32: match per-channel mean/std of latents to reference. All f32 MTLBuffers.
+/// GPU-accelerated: parallel reduction for per-channel statistics, then CPU computes scale/shift,
+/// then GPU applies channel_scale_bias.
 public func adainFilter(_ latents: MTLBuffer, reference: MTLBuffer,
                          B: Int, C: Int, latShape: [Int], refShape: [Int],
                          factor: Float = 1.0) -> MTLBuffer {
     let latSpatial = latShape[2] * latShape[3] * latShape[4]
     let refSpatial = refShape[2] * refShape[3] * refShape[4]
+    let bc = B * C
+    let ctx = MetalContext.shared
 
-    let latPtr = latents.contents().assumingMemoryBound(to: Float.self)
-    let refPtr = reference.contents().assumingMemoryBound(to: Float.self)
+    // GPU: compute per-channel mean and variance for both latents and reference
+    let latMeanBuf = ctx.device.makeBuffer(length: bc * 4, options: .storageModeShared)!
+    let latVarBuf = ctx.device.makeBuffer(length: bc * 4, options: .storageModeShared)!
+    let refMeanBuf = ctx.device.makeBuffer(length: bc * 4, options: .storageModeShared)!
+    let refVarBuf = ctx.device.makeBuffer(length: bc * 4, options: .storageModeShared)!
 
-    var scaleData = [Float](repeating: 0, count: B * C)
-    var shiftData = [Float](repeating: 0, count: B * C)
+    let tgSize = 256
+    let pipe = KernelCache.shared.pipeline("channel_mean_var_f32")
+    var cU = UInt32(C)
+    var latSpatU = UInt32(latSpatial)
+    var refSpatU = UInt32(refSpatial)
 
-    for b in 0..<B {
-        for c in 0..<C {
-            var refSum: Float = 0, refSqSum: Float = 0
-            let refBase = (b * C + c) * refSpatial
-            for s in 0..<refSpatial {
-                let v = refPtr[refBase + s]
-                refSum += v; refSqSum += v * v
-            }
-            let refMean = refSum / Float(refSpatial)
-            let refVar = refSqSum / Float(refSpatial) - refMean * refMean
-            let refStd = sqrtf(max(refVar, 1e-8))
+    ctx.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(latents, offset: 0, index: 0)
+        enc.setBuffer(latMeanBuf, offset: 0, index: 1)
+        enc.setBuffer(latVarBuf, offset: 0, index: 2)
+        enc.setBytes(&cU, length: 4, index: 3)
+        enc.setBytes(&latSpatU, length: 4, index: 4)
+        enc.setThreadgroupMemoryLength(tgSize * 2 * 4, index: 0)
+        enc.dispatchThreadgroups(MTLSize(width: bc, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
+    }
+    ctx.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(reference, offset: 0, index: 0)
+        enc.setBuffer(refMeanBuf, offset: 0, index: 1)
+        enc.setBuffer(refVarBuf, offset: 0, index: 2)
+        enc.setBytes(&cU, length: 4, index: 3)
+        enc.setBytes(&refSpatU, length: 4, index: 4)
+        enc.setThreadgroupMemoryLength(tgSize * 2 * 4, index: 0)
+        enc.dispatchThreadgroups(MTLSize(width: bc, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
+    }
 
-            var latSum: Float = 0, latSqSum: Float = 0
-            let latBase = (b * C + c) * latSpatial
-            for s in 0..<latSpatial {
-                let v = latPtr[latBase + s]
-                latSum += v; latSqSum += v * v
-            }
-            let latMean = latSum / Float(latSpatial)
-            let latVar = latSqSum / Float(latSpatial) - latMean * latMean
-            let latStd = sqrtf(max(latVar, 1e-8))
+    // If batching, flush so GPU results are available on CPU
+    if ctx.batching {
+        ctx.endBatch()
+        ctx.beginBatch()
+    }
 
-            let sc = refStd / latStd
-            let sh = refMean - sc * latMean
-            let finalScale = 1.0 - factor + factor * sc
-            let finalShift = factor * sh
-            scaleData[b * C + c] = finalScale
-            shiftData[b * C + c] = finalShift
-        }
+    // CPU: compute per-channel scale and shift from statistics
+    let latMean = latMeanBuf.contents().assumingMemoryBound(to: Float.self)
+    let latVar = latVarBuf.contents().assumingMemoryBound(to: Float.self)
+    let refMean = refMeanBuf.contents().assumingMemoryBound(to: Float.self)
+    let refVar = refVarBuf.contents().assumingMemoryBound(to: Float.self)
+
+    var scaleData = [Float](repeating: 0, count: bc)
+    var shiftData = [Float](repeating: 0, count: bc)
+    for i in 0..<bc {
+        let refStd = sqrtf(max(refVar[i], 1e-8))
+        let latStd = sqrtf(max(latVar[i], 1e-8))
+        let sc = refStd / latStd
+        let sh = refMean[i] - sc * latMean[i]
+        scaleData[i] = 1.0 - factor + factor * sc
+        shiftData[i] = factor * sh
     }
 
     let scaleBuf = scaleData.withUnsafeBytes {
-        MetalContext.shared.device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)!
+        ctx.device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)!
     }
     let shiftBuf = shiftData.withUnsafeBytes {
-        MetalContext.shared.device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)!
+        ctx.device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)!
     }
     return channelScaleBiasF32(x: latents, scale: scaleBuf, bias: shiftBuf,
                                 B: B, C: C, spatial: latSpatial)

@@ -27,18 +27,29 @@ final class VideoRunner: ObservableObject {
     @Published var width: Int = 24
     @Published var seed: UInt64 = 42
 
-    private var pipeline: LTXPipeline?
     private var vaeDecoder: VAEDecoder?
 
     var deviceName: String { MetalContext.shared.device.name }
 
+    /// Load a fresh DiT pipeline (caller is responsible for letting it go out of scope to free memory).
+    /// Not MainActor-isolated — safe to call from background threads.
+    nonisolated private func loadDiTPipeline(ditPath: String, log: ((String) -> Void)? = nil) throws -> LTXPipeline {
+        let start = CFAbsoluteTimeGetCurrent()
+        let ditURL = URL(fileURLWithPath: ditPath)
+        let ditWeights = try loadDiTWeights(from: ditURL)
+        let ditModel = DiTModel(weights: ditWeights)
+        let pipeline = LTXPipeline(model: ditModel)
+        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        log?(String(format: "DiT loaded in %.1fs (%d blocks)", elapsed, ditWeights.config.numLayers))
+        return pipeline
+    }
+
     func loadModels() {
         guard !isRunning else { return }
         isRunning = true
-        statusText = "Loading DiT weights..."
+        statusText = "Loading VAE..."
         debugLog = ""
 
-        let ditDir = ditPath
         let vaePth = vaePath
 
         Thread.detachNewThread { [weak self] in
@@ -46,21 +57,7 @@ final class VideoRunner: ObservableObject {
             do {
                 let start = CFAbsoluteTimeGetCurrent()
 
-                // Load DiT
-                let ditURL = URL(fileURLWithPath: ditDir)
-                let ditWeights = try loadDiTWeights(from: ditURL)
-                let ditModel = DiTModel(weights: ditWeights)
-                let pipeline = LTXPipeline(model: ditModel)
-
-                let ditTime = CFAbsoluteTimeGetCurrent() - start
-                let msg1 = String(format: "DiT loaded in %.1fs (%d blocks)\n", ditTime, ditWeights.config.numLayers)
-                DispatchQueue.main.async { [weak self] in
-                    self?.debugLog += msg1
-                    self?.statusText = "Loading VAE..."
-                }
-
-                // Load VAE
-                let vaeStart = CFAbsoluteTimeGetCurrent()
+                // Load VAE only (small, kept resident)
                 let vaeURL = URL(fileURLWithPath: vaePth)
                 let vaeFile = try SafeTensorsFile(url: vaeURL)
                 let prefix: String
@@ -72,15 +69,13 @@ final class VideoRunner: ObservableObject {
                     throw VideoRunnerError.noDecoderKeys
                 }
                 let vaeDecoder = try VAEDecoder(file: vaeFile, prefix: prefix)
-                let vaeTime = CFAbsoluteTimeGetCurrent() - vaeStart
+                let vaeTime = CFAbsoluteTimeGetCurrent() - start
 
-                let msg2 = String(format: "VAE loaded in %.1fs\n", vaeTime)
-                let totalTime = CFAbsoluteTimeGetCurrent() - start
+                let msg = String(format: "VAE loaded in %.1fs\n", vaeTime)
                 DispatchQueue.main.async { [weak self] in
-                    self?.pipeline = pipeline
                     self?.vaeDecoder = vaeDecoder
-                    self?.debugLog += msg2
-                    self?.statusText = String(format: "Models loaded (%.1fs)", totalTime)
+                    self?.debugLog += msg
+                    self?.statusText = String(format: "VAE loaded (%.1fs). DiT loaded on demand per stage.", vaeTime)
                     self?.isRunning = false
                 }
             } catch {
@@ -94,7 +89,6 @@ final class VideoRunner: ObservableObject {
 
     func generate() {
         guard !isRunning else { return }
-        guard let pipeline else { statusText = "Load models first"; return }
         guard let vaeDecoder else { statusText = "Load VAE first"; return }
 
         let embPath = embeddingsPath
@@ -111,6 +105,7 @@ final class VideoRunner: ObservableObject {
         let w = width
         let s = seed
         let upPath = upsamplerPath
+        let ditPth = ditPath
 
         // Distilled model timesteps (from LTX-Video config)
         let pass1Timesteps: [Float] = [1.0, 0.9937, 0.9875, 0.9812, 0.9750, 0.9094, 0.7250]
@@ -181,32 +176,41 @@ final class VideoRunner: ObservableObject {
                 let finalH = pass1H * 2
                 let finalW = pass1W * 2
 
-                // === Pass 1: generate latents from noise (f32) ===
-                updateStatus("Pass 1 denoising...")
-                updateLog("=== Pass 1: \(nFrames)f × \(pass1H)×\(pass1W) ===")
+                // === Stage 1: Load DiT → Pass 1 → Release DiT ===
                 let latentC = 128  // config.outChannels
-                let ditStart = CFAbsoluteTimeGetCurrent()
-                let pass1F32 = pipeline.generateLatentsF32(
-                    textEmbeddings: textEmb,
-                    textSeqLen: textSeqLen,
-                    numFrames: nFrames,
-                    height: pass1H,
-                    width: pass1W,
-                    explicitTimesteps: pass1Timesteps,
-                    seed: s,
-                    progressHandler: { step, total in
-                        let snap = "Pass 1 step \(step)/\(total)"
-                        DispatchQueue.main.async { [weak self] in
-                            self?.progress = (step, total)
-                            self?.statusText = snap
-                        }
-                    },
-                    log: { msg in updateLog("  DiT: \(msg)") }
-                )
-                let ditTime = CFAbsoluteTimeGetCurrent() - ditStart
                 let pass1Count = 1 * latentC * nFrames * pass1H * pass1W
-                updateLog(String(format: "Pass 1 done: %.2fs (%d steps)", ditTime, pass1Timesteps.count))
-                updateLog("Pass 1 latents f32: \(f32Stats(pass1F32, count: pass1Count))")
+                let pass1F32: MTLBuffer
+                do {
+                    updateStatus("Loading DiT for Pass 1...")
+                    let pipeline = try self.loadDiTPipeline(ditPath: ditPth) { msg in updateLog(msg) }
+
+                    updateStatus("Pass 1 denoising...")
+                    updateLog("=== Pass 1: \(nFrames)f × \(pass1H)×\(pass1W) ===")
+                    let ditStart = CFAbsoluteTimeGetCurrent()
+                    pass1F32 = pipeline.generateLatents(
+                        textEmbeddings: textEmb,
+                        textSeqLen: textSeqLen,
+                        numFrames: nFrames,
+                        height: pass1H,
+                        width: pass1W,
+                        explicitTimesteps: pass1Timesteps,
+                        seed: s,
+                        progressHandler: { step, total in
+                            let snap = "Pass 1 step \(step)/\(total)"
+                            DispatchQueue.main.async { [weak self] in
+                                self?.progress = (step, total)
+                                self?.statusText = snap
+                            }
+                        },
+                        log: { msg in updateLog("  DiT: \(msg)") }
+                    )
+                    let ditTime = CFAbsoluteTimeGetCurrent() - ditStart
+                    updateLog(String(format: "Pass 1 done: %.2fs (%d steps)", ditTime, pass1Timesteps.count))
+                    updateLog("Pass 1 latents f32: \(f32Stats(pass1F32, count: pass1Count))")
+                    // pipeline goes out of scope here → ARC releases DiT weights
+                }
+                MetalContext.shared.bufferPool.releaseAll(keeping: [pass1F32])
+                updateLog("Released DiT weights + all intermediates after Pass 1")
 
                 // DEBUG: skip upsampler+pass2, decode pass1 directly
                 let skipPass2 = false
@@ -237,33 +241,40 @@ final class VideoRunner: ObservableObject {
                 }
 
                 // === Stage 2: Upsample + AdaIN (all f32) ===
-                updateStatus("Loading upsampler...")
-                let upStart = CFAbsoluteTimeGetCurrent()
-                let upWeights = try loadUpsamplerWeights(from: URL(fileURLWithPath: upPath))
-                let upsampler = LatentUpsampler(weights: upWeights)
-                updateLog(String(format: "Upsampler loaded in %.1fs", CFAbsoluteTimeGetCurrent() - upStart))
-
-                updateStatus("Upsampling latents (f32)...")
-                let denormedPass1F32 = vaeDecoder.denormalizeF32(pass1F32, B: 1, C: latentC, F: nFrames, H: pass1H, W: pass1W)
-                updateLog("Denormalized pass1 f32: \(f32Stats(denormedPass1F32, count: pass1Count))")
-
-                let upsampledF32 = upsampler.forward(denormedPass1F32, B: 1, F: nFrames, H: pass1H, W: pass1W) { msg in
-                    updateLog("  Upsampler: \(msg)")
-                }
                 let upCount = 1 * latentC * nFrames * finalH * finalW
-                updateLog("Upsampled f32: \(f32Stats(upsampledF32, count: upCount))")
+                let adainedF32: MTLBuffer
+                do {
+                    updateStatus("Loading upsampler...")
+                    let upStart = CFAbsoluteTimeGetCurrent()
+                    let upWeights = try loadUpsamplerWeights(from: URL(fileURLWithPath: upPath))
+                    let upsampler = LatentUpsampler(weights: upWeights)
+                    updateLog(String(format: "Upsampler loaded in %.1fs", CFAbsoluteTimeGetCurrent() - upStart))
 
-                let renormedF32 = vaeDecoder.normalizeF32(upsampledF32, B: 1, C: latentC, F: nFrames, H: finalH, W: finalW)
-                updateLog("Re-normalized f32: \(f32Stats(renormedF32, count: upCount))")
+                    updateStatus("Upsampling latents (f32)...")
+                    let denormedPass1F32 = vaeDecoder.denormalize(pass1F32, B: 1, C: latentC, F: nFrames, H: pass1H, W: pass1W)
+                    updateLog("Denormalized pass1 f32: \(f32Stats(denormedPass1F32, count: pass1Count))")
 
-                let adainedF32 = adainFilter(renormedF32, reference: pass1F32,
-                                                 B: 1, C: latentC,
-                                                 latShape: [1, latentC, nFrames, finalH, finalW],
-                                                 refShape: [1, latentC, nFrames, pass1H, pass1W],
-                                                 factor: 1.0)
-                updateLog("AdaIN f32: \(f32Stats(adainedF32, count: upCount))")
+                    let upsampledF32 = upsampler.forward(denormedPass1F32, B: 1, F: nFrames, H: pass1H, W: pass1W) { msg in
+                        updateLog("  Upsampler: \(msg)")
+                    }
+                    updateLog("Upsampled f32: \(f32Stats(upsampledF32, count: upCount))")
 
-                // === Stage 3: Pass 2 — denoise upsampled latents (f32) ===
+                    let renormedF32 = vaeDecoder.normalize(upsampledF32, B: 1, C: latentC, F: nFrames, H: finalH, W: finalW)
+                    updateLog("Re-normalized f32: \(f32Stats(renormedF32, count: upCount))")
+
+                    adainedF32 = adainFilter(renormedF32, reference: pass1F32,
+                                                     B: 1, C: latentC,
+                                                     latShape: [1, latentC, nFrames, finalH, finalW],
+                                                     refShape: [1, latentC, nFrames, pass1H, pass1W],
+                                                     factor: 1.0)
+                    updateLog("AdaIN f32: \(f32Stats(adainedF32, count: upCount))")
+                    // upWeights, upsampler, denormedPass1F32, upsampledF32, renormedF32
+                    // all go out of scope here → ARC releases upsampler weights + intermediates
+                }
+                MetalContext.shared.bufferPool.releaseAll(keeping: [adainedF32])
+                updateLog("Released upsampler + all intermediates after Stage 2")
+
+                // === Stage 3: Load DiT → Pass 2 → Release DiT ===
                 // Load MLX pass2 noise if available
                 var pass2NoiseOverride: MTLBuffer? = nil
                 let pass2NoiseURL = URL(fileURLWithPath: "/tmp/mlx_pass2_noise.safetensors")
@@ -284,30 +295,39 @@ final class VideoRunner: ObservableObject {
                     updateLog("Loaded MLX pass2 noise: \(f32Stats(pass2NoiseOverride!, count: nc))")
                 }
 
-                updateStatus("Pass 2 denoising...")
-                updateLog("=== Pass 2: \(nFrames)f × \(finalH)×\(finalW) ===")
-                let pass2Start = CFAbsoluteTimeGetCurrent()
-                let pass2F32 = pipeline.denoiseLatentsF32(
-                    inputLatentsF32: adainedF32,
-                    B: 1, C: latentC, numFrames: nFrames, height: finalH, width: finalW,
-                    textEmbeddings: textEmb,
-                    textSeqLen: textSeqLen,
-                    timesteps: pass2Timesteps,
-                    seed: s,
-                    noiseOverrideF32: pass2NoiseOverride,
-                    progressHandler: { step, total in
-                        let snap = "Pass 2 step \(step)/\(total)"
-                        DispatchQueue.main.async { [weak self] in
-                            self?.progress = (step, total)
-                            self?.statusText = snap
-                        }
-                    },
-                    log: { msg in updateLog("  DiT: \(msg)") }
-                )
-                let pass2Time = CFAbsoluteTimeGetCurrent() - pass2Start
                 let pass2Count = 1 * latentC * nFrames * finalH * finalW
-                updateLog(String(format: "Pass 2 done: %.2fs (%d steps)", pass2Time, pass2Timesteps.count))
-                updateLog("Pass 2 latents f32: \(f32Stats(pass2F32, count: pass2Count))")
+                let pass2F32: MTLBuffer
+                do {
+                    updateStatus("Loading DiT for Pass 2...")
+                    let pipeline = try self.loadDiTPipeline(ditPath: ditPth) { msg in updateLog(msg) }
+
+                    updateStatus("Pass 2 denoising...")
+                    updateLog("=== Pass 2: \(nFrames)f × \(finalH)×\(finalW) ===")
+                    let pass2Start = CFAbsoluteTimeGetCurrent()
+                    pass2F32 = pipeline.denoiseLatents(
+                        inputLatentsF32: adainedF32,
+                        B: 1, C: latentC, numFrames: nFrames, height: finalH, width: finalW,
+                        textEmbeddings: textEmb,
+                        textSeqLen: textSeqLen,
+                        timesteps: pass2Timesteps,
+                        seed: s,
+                        noiseOverrideF32: pass2NoiseOverride,
+                        progressHandler: { step, total in
+                            let snap = "Pass 2 step \(step)/\(total)"
+                            DispatchQueue.main.async { [weak self] in
+                                self?.progress = (step, total)
+                                self?.statusText = snap
+                            }
+                        },
+                        log: { msg in updateLog("  DiT: \(msg)") }
+                    )
+                    let pass2Time = CFAbsoluteTimeGetCurrent() - pass2Start
+                    updateLog(String(format: "Pass 2 done: %.2fs (%d steps)", pass2Time, pass2Timesteps.count))
+                    updateLog("Pass 2 latents f32: \(f32Stats(pass2F32, count: pass2Count))")
+                    // pipeline goes out of scope here → ARC releases DiT weights
+                }
+                MetalContext.shared.bufferPool.releaseAll(keeping: [pass2F32])
+                updateLog("Released DiT weights after Pass 2")
 
                 // === VAE decode (cast f32→f16 once) ===
                 updateLog("Casting to f16 for VAE...")
@@ -375,7 +395,6 @@ final class VideoRunner: ObservableObject {
 
     func generateFromMLXAdaIN() {
         guard !isRunning else { return }
-        guard let pipeline else { statusText = "Load models first"; return }
         guard let vaeDecoder else { statusText = "Load VAE first"; return }
 
         isRunning = true
@@ -384,6 +403,7 @@ final class VideoRunner: ObservableObject {
         decodedImage = nil
 
         let embPath = embeddingsPath
+        let ditPth = ditPath
         let pass2Timesteps: [Float] = [0.9094, 0.7250, 0.4219]
 
         Thread.detachNewThread { [weak self] in
@@ -463,9 +483,11 @@ final class VideoRunner: ObservableObject {
                     updateLog("No MLX noise file, using srand48 noise")
                 }
 
-                // Pass 2
+                // Pass 2 — load DiT on demand
+                updateStatus("Loading DiT for Pass 2...")
+                let pipeline = try self.loadDiTPipeline(ditPath: ditPth) { msg in updateLog(msg) }
                 updateStatus("Pass 2 denoising (MLX input)...")
-                let pass2F32 = pipeline.denoiseLatentsF32(
+                let pass2F32 = pipeline.denoiseLatents(
                     inputLatentsF32: adainF32,
                     B: B, C: latentC, numFrames: nFrames, height: finalH, width: finalW,
                     textEmbeddings: textEmb, textSeqLen: realTokens,

@@ -134,4 +134,12 @@ public final class BufferPool: @unchecked Sendable {
     public func purge() {
         free.removeAll()
     }
+
+    /// Nuclear option: drop ALL buffers (active + free). Use between pipeline stages.
+    /// Only buffers in the `keeping` list survive.
+    public func releaseAll(keeping: [MTLBuffer] = []) {
+        let keepSet = Set(keeping.map { ObjectIdentifier($0) })
+        active.removeAll { !keepSet.contains(ObjectIdentifier($0)) }
+        free.removeAll()
+    }
 }

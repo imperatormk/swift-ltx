@@ -707,19 +707,19 @@ public class DiTModel {
         let rows = B * numTokens
 
         let numAdaParams = block.numAdaParams
-        let adaParams = computeAdaLNParamsF32(timestepEmbF32, table: block.scaleShiftTable,
-                                               B: B, dim: dim, numParams: numAdaParams)
+        let ada = computeAdaLNParamsF32(timestepEmbF32, table: block.scaleShiftTable,
+                                         B: B, dim: dim, numParams: numAdaParams)
 
         // 1. Self-attention: norm f32→f32, modulate f32, attention f32
         var normHiddenF32: MTLBuffer
         if numAdaParams == 6 {
             normHiddenF32 = block.norm1.applyF32(hiddenF32, dim: dim, rows: rows)
-            let scaleBcast = broadcastToSeqF32(adaParams[1], numTokens: numTokens, dim: dim, B: B)
-            let shiftBcast = broadcastToSeqF32(adaParams[0], numTokens: numTokens, dim: dim, B: B)
+            let scaleBcast = broadcastToSeqF32(ada.buffer, numTokens: numTokens, dim: dim, B: B, inputOffset: ada.offset(1))
+            let shiftBcast = broadcastToSeqF32(ada.buffer, numTokens: numTokens, dim: dim, B: B, inputOffset: ada.offset(0))
             normHiddenF32 = adalnModulateF32(normHiddenF32, scale: scaleBcast, shift: shiftBcast, count: count)
         } else {
             normHiddenF32 = block.norm1.applyF32(hiddenF32, dim: dim, rows: rows)
-            let scaleBcast = broadcastToSeqF32(adaParams[0], numTokens: numTokens, dim: dim, B: B)
+            let scaleBcast = broadcastToSeqF32(ada.buffer, numTokens: numTokens, dim: dim, B: B, inputOffset: ada.offset(0))
             let onePlusS = onePlusF32(scaleBcast, count: count)
             normHiddenF32 = elemMulF32(normHiddenF32, onePlusS, count: count)
         }
@@ -734,8 +734,7 @@ public class DiTModel {
 
         // Gate f32 * attnOut f32 → f32, add to residual
         let gateIdx = numAdaParams == 6 ? 2 : 1
-        if blockIdx == 0 { forwardLog?("  gate[\(gateIdx)]: \(f32Stats(adaParams[gateIdx], count: B * dim))") }
-        let gateBcast = broadcastToSeqF32(adaParams[gateIdx], numTokens: numTokens, dim: dim, B: B)
+        let gateBcast = broadcastToSeqF32(ada.buffer, numTokens: numTokens, dim: dim, B: B, inputOffset: ada.offset(gateIdx))
         let gatedAttn = elemMulF32(attnOutF32, gateBcast, count: count)
         if blockIdx == 0 { forwardLog?("  gatedAttn: \(f32Stats(gatedAttn, count: count))") }
         var resF32 = hiddenF32
@@ -759,12 +758,12 @@ public class DiTModel {
         var normFFF32: MTLBuffer
         if numAdaParams == 6 {
             normFFF32 = block.norm2.applyF32(resF32, dim: dim, rows: rows)
-            let scaleBcast = broadcastToSeqF32(adaParams[4], numTokens: numTokens, dim: dim, B: B)
-            let shiftBcast = broadcastToSeqF32(adaParams[3], numTokens: numTokens, dim: dim, B: B)
+            let scaleBcast = broadcastToSeqF32(ada.buffer, numTokens: numTokens, dim: dim, B: B, inputOffset: ada.offset(4))
+            let shiftBcast = broadcastToSeqF32(ada.buffer, numTokens: numTokens, dim: dim, B: B, inputOffset: ada.offset(3))
             normFFF32 = adalnModulateF32(normFFF32, scale: scaleBcast, shift: shiftBcast, count: count)
         } else {
             normFFF32 = block.norm2.applyF32(resF32, dim: dim, rows: rows)
-            let scaleBcast = broadcastToSeqF32(adaParams[2], numTokens: numTokens, dim: dim, B: B)
+            let scaleBcast = broadcastToSeqF32(ada.buffer, numTokens: numTokens, dim: dim, B: B, inputOffset: ada.offset(2))
             let onePlusS = onePlusF32(scaleBcast, count: count)
             normFFF32 = elemMulF32(normFFF32, onePlusS, count: count)
         }
@@ -772,8 +771,7 @@ public class DiTModel {
         let ffOutF32 = ffnF32(normFFF32, ff: block.ff, M: rows, dim: dim)
         if blockIdx == 0 { forwardLog?("  ffOut: \(f32Stats(ffOutF32, count: count))") }
         let gateMLPIdx = numAdaParams == 6 ? 5 : 3
-        if blockIdx == 0 { forwardLog?("  gateMLP[\(gateMLPIdx)]: \(f32Stats(adaParams[gateMLPIdx], count: B * dim))") }
-        let gateMLPBcast = broadcastToSeqF32(adaParams[gateMLPIdx], numTokens: numTokens, dim: dim, B: B)
+        let gateMLPBcast = broadcastToSeqF32(ada.buffer, numTokens: numTokens, dim: dim, B: B, inputOffset: ada.offset(gateMLPIdx))
         let gatedFF = elemMulF32(ffOutF32, gateMLPBcast, count: count)
         if blockIdx == 0 { forwardLog?("  gatedFF: \(f32Stats(gatedFF, count: count))") }
         elemAddF32(resF32, gatedFF, count: count)
@@ -819,18 +817,16 @@ public class DiTModel {
         if debugBlock { forwardLog?("    Q(post-norm): \(f32Stats(qF32, count: M * dim))") }
         if debugBlock { forwardLog?("    K(post-norm): \(f32Stats(kF32, count: kvM * dim))") }
 
-        // 3D RoPE f32 (self-attention only)
+        // 3D RoPE f32 (self-attention only) — freqs are [seqLen, dim], kernel broadcasts across batch
         if attn.useRope && !attn.isCrossAttention {
             let qCount = M * dim
             let kCount = kvM * dim
             qF32 = rope3DF32(qF32,
-                             cosFreqs: broadcastRoPEF32(cosFreqs, B: B, seqLen: seqLen, dim: dim),
-                             sinFreqs: broadcastRoPEF32(sinFreqs, B: B, seqLen: seqLen, dim: dim),
-                             dim: dim, count: qCount)
+                             cosFreqs: cosFreqs, sinFreqs: sinFreqs,
+                             dim: dim, count: qCount, seqLen: seqLen)
             kF32 = rope3DF32(kF32,
-                             cosFreqs: broadcastRoPEF32(cosFreqs, B: B, seqLen: kvSeqLen, dim: dim),
-                             sinFreqs: broadcastRoPEF32(sinFreqs, B: B, seqLen: kvSeqLen, dim: dim),
-                             dim: dim, count: kCount)
+                             cosFreqs: cosFreqs, sinFreqs: sinFreqs,
+                             dim: dim, count: kCount, seqLen: kvSeqLen)
         }
 
         if debugBlock { forwardLog?("    Q(post-rope): \(f32Stats(qF32, count: M * dim))") }
@@ -885,29 +881,35 @@ public class DiTModel {
         }
     }
 
-    /// Compute AdaLN params f32: table (f16) + tsEmb (f32) → f32 buffers.
-    /// Returns array of numParams f32 MTLBuffers, each [B, dim].
+    /// Fused AdaLN params: single buffer [numParams, B, dim] f32 + offset accessor.
+    struct AdaLNParams {
+        let buffer: MTLBuffer
+        let B: Int
+        let dim: Int
+        /// Byte offset for param index p.
+        func offset(_ p: Int) -> Int { p * B * dim * 4 }
+    }
+
+    /// Compute AdaLN params f32: table (f16) + tsEmb (f32) → fused f32 buffer.
+    /// Single dispatch writes all params at once (was N separate dispatches).
     private func computeAdaLNParamsF32(_ tsEmbF32: MTLBuffer, table: Tensor,
-                                        B: Int, dim: Int, numParams: Int) -> [MTLBuffer] {
-        var results = [MTLBuffer]()
-        for i in 0..<numParams {
-            let out = MetalContext.shared.device.makeBuffer(length: B * dim * 4, options: .storageModeShared)!
-            var iU = UInt32(i), dU = UInt32(dim), nU = UInt32(numParams)
-            let pipe = KernelCache.shared.pipeline("ada_ln_param_f32")
-            MetalContext.shared.run { enc in
-                enc.setComputePipelineState(pipe)
-                enc.setBuffer(table.buffer, offset: 0, index: 0)
-                enc.setBuffer(tsEmbF32, offset: 0, index: 1)
-                enc.setBuffer(out, offset: 0, index: 2)
-                enc.setBytes(&iU, length: 4, index: 3)
-                enc.setBytes(&dU, length: 4, index: 4)
-                enc.setBytes(&nU, length: 4, index: 5)
-                enc.dispatchThreads(MTLSize(width: B * dim, height: 1, depth: 1),
-                                   threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-            }
-            results.append(out)
+                                        B: Int, dim: Int, numParams: Int) -> AdaLNParams {
+        let totalCount = numParams * B * dim
+        let outBuf = MetalContext.shared.device.makeBuffer(length: totalCount * 4, options: .storageModeShared)!
+        var dU = UInt32(dim), nU = UInt32(numParams), bU = UInt32(B)
+        let pipe = KernelCache.shared.pipeline("ada_ln_params_all_f32")
+        MetalContext.shared.run { enc in
+            enc.setComputePipelineState(pipe)
+            enc.setBuffer(table.buffer, offset: 0, index: 0)
+            enc.setBuffer(tsEmbF32, offset: 0, index: 1)
+            enc.setBuffer(outBuf, offset: 0, index: 2)
+            enc.setBytes(&dU, length: 4, index: 3)
+            enc.setBytes(&nU, length: 4, index: 4)
+            enc.setBytes(&bU, length: 4, index: 5)
+            enc.dispatchThreads(MTLSize(width: B * dim, height: 1, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         }
-        return results
+        return AdaLNParams(buffer: outBuf, B: B, dim: dim)
     }
 }
 
@@ -984,112 +986,9 @@ public class LTXPipeline {
         self.patchifier = patchifier ?? SymmetricPatchifier(patchSize: config.patchSize)
     }
 
-    /// Generate video latents from noise.
-    /// textEmbeddings: [1, textSeqLen, captionChannels] f16
-    /// Returns: [1, outChannels, numFrames, height, width] f16
-    public func generateLatents(
-        textEmbeddings: Tensor,
-        textSeqLen: Int,
-        numFrames: Int = 2,
-        height: Int = 32,
-        width: Int = 32,
-        numSteps: Int = 20,
-        explicitTimesteps: [Float]? = nil,
-        guidanceScale: Float = 1.0,
-        frameRate: Float = 25.0,
-        seed: UInt64 = 42,
-        progressHandler: ((Int, Int) -> Void)? = nil,
-        log: ((String) -> Void)? = nil
-    ) -> Tensor {
-        let B = 1
-        let latentChannels = config.inChannels
-        let numTokens = numFrames * (height / patchifier.patchSize) * (width / patchifier.patchSize)
-
-        if let explicit = explicitTimesteps {
-            scheduler.timesteps = explicit
-            scheduler.numInferenceSteps = explicit.count
-        } else {
-            scheduler.setTimesteps(numSteps: numSteps, numTokens: numTokens)
-        }
-        log?("timesteps: \(scheduler.timesteps.prefix(5))...")
-
-        // Initialize noise [1, C, F, H, W] — load MLX reference noise as f32 directly
-        let noiseData = try! Data(contentsOf: URL(fileURLWithPath: "/Users/zimski/Downloads/mlx_noise_f32.bin"))
-        let noiseCount = noiseData.count / 4  // f32
-        let noiseF32 = noiseData.withUnsafeBytes { ptr in
-            MetalContext.shared.device.makeBuffer(bytes: ptr.baseAddress!, length: ptr.count, options: .storageModeShared)!
-        }
-        log?("noise (mlx f32): \(f32Stats(noiseF32, count: noiseCount))")
-
-        // Patchify f32
-        var (tokensF32, latentCoords) = patchifier.patchifyF32(noiseF32, B: B, C: latentChannels,
-                                                                F: numFrames, H: height, W: width)
-        let tokenCount = B * numTokens * latentChannels
-        log?("patchified f32: \(f32Stats(tokensF32, count: tokenCount))")
-
-        // Convert to pixel coords for RoPE
-        let pixelCoords = latentToPixelCoords(latentCoords, frameRate: frameRate)
-
-        // Precompute 3D RoPE
-        let (cosFreqs, sinFreqs) = precomputeFreqsCIS3D(
-            indicesGrid: pixelCoords,
-            maxPos: config.positionalEmbeddingMaxPos,
-            theta: config.positionalEmbeddingTheta,
-            dim: config.innerDim)
-        log?("rope freqs precomputed (f32)")
-
-        log?("textEmb: shape=\(textEmbeddings.shape) \(f32Stats(textEmbeddings.buffer, count: textEmbeddings.count))")
-
-        let pool = MetalContext.shared.bufferPool
-
-        // Enable detailed logging for first step only
-        model.forwardLog = { msg in log?("  fwd: \(msg)") }
-
-        // Denoising loop (all f32)
-        for i in 0..<scheduler.timesteps.count {
-            let t = scheduler.timesteps[i]
-            let tsTensor = Tensor([t], shape: [B])
-
-            let ctx = MetalContext.shared
-            let debugging = model.forwardLog != nil
-            if !debugging { ctx.beginBatch() }
-
-            let noisePredF32 = model.forward(
-                hiddenStatesF32: tokensF32,
-                cosFreqs: cosFreqs, sinFreqs: sinFreqs,
-                encoderHiddenStates: textEmbeddings,
-                timestep: tsTensor,
-                B: B, numTokens: numTokens)
-
-            if !debugging { ctx.endBatch() }
-
-            log?("step \(i) t=\(String(format:"%.4f",t)) pred_f32: \(f32Stats(noisePredF32, count: tokenCount)) tokens_in_f32: \(f32Stats(tokensF32, count: tokenCount))")
-
-            tokensF32 = scheduler.stepF32(modelOutput: noisePredF32, timestepIndex: i, sample: tokensF32, count: tokenCount)
-
-            pool.reset(keeping: [tokensF32, cosFreqs, sinFreqs, textEmbeddings.buffer])
-
-            log?("step \(i) tokens_out_f32: \(f32Stats(tokensF32, count: tokenCount))")
-
-            if i == 0 { model.forwardLog = nil }
-            progressHandler?(i + 1, scheduler.timesteps.count)
-        }
-
-        log?("final tokens f32: \(f32Stats(tokensF32, count: tokenCount))")
-
-        // Unpatchify f32, then cast to f16 once for VAE
-        let resultF32 = patchifier.unpatchifyF32(tokensF32, B: B, C: config.outChannels,
-                                                  F: numFrames, H: height, W: width)
-        let resultCount = B * config.outChannels * numFrames * height * width
-        log?("unpatchified f32: \(f32Stats(resultF32, count: resultCount))")
-        let result = castF32toF16(resultF32, count: resultCount, shape: [B, config.outChannels, numFrames, height, width])
-        log?("final f16: \(f16Stats(result))")
-        return result
-    }
-
-    /// Generate video latents from noise, returning f32 MTLBuffer directly (no f16 cast).
+    /// Generate video latents from noise, returning f32 MTLBuffer.
     /// Shape: [1, outChannels, numFrames, height, width] f32
-    public func generateLatentsF32(
+    public func generateLatents(
         textEmbeddings: Tensor,
         textSeqLen: Int,
         numFrames: Int = 2,
@@ -1173,89 +1072,9 @@ public class LTXPipeline {
         return resultF32
     }
 
-    /// Denoise existing latents (for second pass of multi-scale pipeline).
-    /// Noises the input latents to the first timestep level, then denoises.
-    public func denoiseLatents(
-        inputLatents: Tensor,
-        textEmbeddings: Tensor,
-        textSeqLen: Int,
-        timesteps explicitTimesteps: [Float],
-        guidanceScale: Float = 1.0,
-        frameRate: Float = 25.0,
-        seed: UInt64 = 42,
-        progressHandler: ((Int, Int) -> Void)? = nil,
-        log: ((String) -> Void)? = nil
-    ) -> Tensor {
-        let B = inputLatents.shape[0]
-        let C = inputLatents.shape[1]
-        let numFrames = inputLatents.shape[2]
-        let height = inputLatents.shape[3]
-        let width = inputLatents.shape[4]
-
-        scheduler.timesteps = explicitTimesteps
-        scheduler.numInferenceSteps = explicitTimesteps.count
-
-        // Cast input latents f16 → f32 once
-        let inputF32 = castF16toF32(inputLatents)
-        let totalCount = inputLatents.count
-
-        // Noise the input latents to first timestep level (all f32)
-        // noised = t * noise + (1 - t) * input
-        let firstT = explicitTimesteps[0]
-        let noiseF32 = randomNormalF32(count: totalCount, seed: seed &+ 1)  // different seed
-        let noisedF32 = elemAddScaled2F32(noiseF32, inputF32, scaleA: firstT, scaleB: 1.0 - firstT, count: totalCount)
-        log?("noised latents f32 (t=\(firstT)): \(f32Stats(noisedF32, count: totalCount))")
-
-        // Patchify f32
-        let numTokens = numFrames * (height / patchifier.patchSize) * (width / patchifier.patchSize)
-        var (tokensF32, latentCoords) = patchifier.patchifyF32(noisedF32, B: B, C: C,
-                                                                F: numFrames, H: height, W: width)
-        let tokenCount = B * numTokens * C
-
-        let pixelCoords = latentToPixelCoords(latentCoords, frameRate: frameRate)
-        let (cosFreqs, sinFreqs) = precomputeFreqsCIS3D(
-            indicesGrid: pixelCoords,
-            maxPos: config.positionalEmbeddingMaxPos,
-            theta: config.positionalEmbeddingTheta,
-            dim: config.innerDim)
-
-        let pool = MetalContext.shared.bufferPool
-
-        // Denoising loop (all f32)
-        for i in 0..<explicitTimesteps.count {
-            let t = explicitTimesteps[i]
-            let tsTensor = Tensor([t], shape: [B])
-
-            let ctx = MetalContext.shared
-            ctx.beginBatch()
-
-            let noisePredF32 = model.forward(
-                hiddenStatesF32: tokensF32,
-                cosFreqs: cosFreqs, sinFreqs: sinFreqs,
-                encoderHiddenStates: textEmbeddings,
-                timestep: tsTensor,
-                B: B, numTokens: numTokens)
-
-            ctx.endBatch()
-
-            log?("pass2 step \(i) t=\(String(format:"%.4f",t)) pred_f32: \(f32Stats(noisePredF32, count: tokenCount))")
-
-            tokensF32 = scheduler.stepF32(modelOutput: noisePredF32, timestepIndex: i, sample: tokensF32, count: tokenCount)
-            pool.reset(keeping: [tokensF32, cosFreqs, sinFreqs, textEmbeddings.buffer])
-
-            progressHandler?(i + 1, explicitTimesteps.count)
-        }
-
-        // Unpatchify f32, then cast to f16 once for VAE
-        let resultF32 = patchifier.unpatchifyF32(tokensF32, B: B, C: config.outChannels,
-                                                  F: numFrames, H: height, W: width)
-        let resultCount = B * config.outChannels * numFrames * height * width
-        return castF32toF16(resultF32, count: resultCount, shape: [B, config.outChannels, numFrames, height, width])
-    }
-
-    /// Denoise existing latents (f32 in, f32 out). No f16 conversions.
+    /// Denoise existing latents (f32 in, f32 out).
     /// inputLatentsF32: f32 MTLBuffer with shape [B, C, numFrames, height, width]
-    public func denoiseLatentsF32(
+    public func denoiseLatents(
         inputLatentsF32: MTLBuffer,
         B: Int, C: Int, numFrames: Int, height: Int, width: Int,
         textEmbeddings: Tensor,
