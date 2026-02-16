@@ -133,10 +133,10 @@ public func adainFilter(_ latents: MTLBuffer, reference: MTLBuffer,
     let ctx = MetalContext.shared
 
     // GPU: compute per-channel mean and variance for both latents and reference
-    let latMeanBuf = ctx.device.makeBuffer(length: bc * 4, options: .storageModeShared)!
-    let latVarBuf = ctx.device.makeBuffer(length: bc * 4, options: .storageModeShared)!
-    let refMeanBuf = ctx.device.makeBuffer(length: bc * 4, options: .storageModeShared)!
-    let refVarBuf = ctx.device.makeBuffer(length: bc * 4, options: .storageModeShared)!
+    let latMeanBuf = ctx.bufferPool.get(length: bc * 4)
+    let latVarBuf = ctx.bufferPool.get(length: bc * 4)
+    let refMeanBuf = ctx.bufferPool.get(length: bc * 4)
+    let refVarBuf = ctx.bufferPool.get(length: bc * 4)
 
     let tgSize = 256
     let pipe = KernelCache.shared.pipeline("channel_mean_var_f32")

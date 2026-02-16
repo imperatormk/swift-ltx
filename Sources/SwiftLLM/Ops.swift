@@ -452,6 +452,37 @@ public func matmulF32xF32Pooled(
     return matmulF32xF32(a, b, M: M, K: K, N: N)
 }
 
+/// f32×bf16 → f32 GEMM via FlashAttention. A: [M,K] f32, B^T: [N,K] bf16, C: [M,N] f32.
+public func matmulF32xBF16(
+    _ a: MTLBuffer, _ b: MTLBuffer,
+    M: Int, K: Int, N: Int
+) -> MTLBuffer {
+    var gemmDesc = GEMMDescriptor()
+    gemmDesc.matrixDimensions = (M: UInt32(M), N: UInt32(N), K: UInt32(K))
+    gemmDesc.memoryPrecisions = (A: .FP32, B: .BF16, C: .FP32)
+    gemmDesc.transposeState = (A: false, B: true)
+    gemmDesc.quantizedB = false
+
+    let (kernel, pipeline) = GEMMKernel.pipeline(for: gemmDesc)
+    let out = MetalContext.shared.bufferPool.get(length: M * N * 4)
+
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipeline)
+        enc.setThreadgroupMemoryLength(Int(kernel.threadgroupMemoryAllocation), index: 0)
+        enc.setBuffer(a, offset: 0, index: 0)
+        enc.setBuffer(b, offset: 0, index: 1)
+        enc.setBuffer(out, offset: 0, index: 2)
+        let gridSize = MTLSize(
+            width: (N + Int(kernel.blockDimensions.N) - 1) / Int(kernel.blockDimensions.N),
+            height: (M + Int(kernel.blockDimensions.M) - 1) / Int(kernel.blockDimensions.M),
+            depth: 1)
+        enc.dispatchThreadgroups(
+            gridSize,
+            threadsPerThreadgroup: MTLSize(width: Int(kernel.threadgroupSize), height: 1, depth: 1))
+    }
+    return out
+}
+
 /// f32×f16 → f32 GEMM via FlashAttention. A: [M,K] f32, B^T: [N,K] f16, C: [M,N] f32.
 public func matmulF32xF16(
     _ a: MTLBuffer, _ b: Tensor,

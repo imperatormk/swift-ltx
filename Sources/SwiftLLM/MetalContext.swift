@@ -94,10 +94,10 @@ public final class MetalContext: @unchecked Sendable {
 public final class BufferPool: @unchecked Sendable {
     /// Buffers currently in use this pass (kept alive so Metal doesn't dealloc).
     private var active: [MTLBuffer] = []
-    /// Free buffers by log2(size) bucket.
+    /// Free buffers by exact size.
     private var free: [Int: [MTLBuffer]] = [:]
 
-    /// Get a buffer of at least `length` bytes. May be larger (power-of-2 rounded).
+    /// Get a buffer of at least `length` bytes.
     public func get(length: Int) -> MTLBuffer {
         let size = max(length, 256)
         if var list = free[size], !list.isEmpty {
@@ -141,5 +141,13 @@ public final class BufferPool: @unchecked Sendable {
         let keepSet = Set(keeping.map { ObjectIdentifier($0) })
         active.removeAll { !keepSet.contains(ObjectIdentifier($0)) }
         free.removeAll()
+    }
+
+    /// Debug: total bytes in active + free lists.
+    public var stats: (active: Int, free: Int, activeCount: Int, freeCount: Int) {
+        let freeBytes = free.values.reduce(0) { $0 + $1.reduce(0) { $0 + $1.length } }
+        let freeCount = free.values.reduce(0) { $0 + $1.count }
+        let activeBytes = active.reduce(0) { $0 + $1.length }
+        return (activeBytes, freeBytes, active.count, freeCount)
     }
 }

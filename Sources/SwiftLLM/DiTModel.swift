@@ -42,9 +42,9 @@ public struct RectifiedFlowConfig {
 
 // MARK: - DiT Weights
 
-/// Linear layer weights: weight [N, K] f32, bias [N] f16 (optional), biasF32 [N] f32 (optional).
+/// Linear layer weights: weight [N, K] (bf16 or f32), bias [N] f16 (optional), biasF32 [N] f32 (optional).
 public struct DiTLinear {
-    public let weight: Tensor    // [N, K] f32
+    public let weight: Tensor    // [N, K] bf16 or f32
     public let bias: Tensor?     // [N] f16
     public let biasF32: MTLBuffer?  // [N] f32 (for all-f32 path)
     public let K: Int
@@ -73,19 +73,21 @@ public struct DiTLinear {
         return castF32toF16(f32buf, count: M * N, shape: [M, N])
     }
 
-    /// f16 input → f32, × f32 weight → f32 output.
+    /// f16 input → f32, × weight → f32 output.
     public func applyF32(_ x: Tensor, M: Int) -> MTLBuffer {
         let xF32 = castF16toF32(x)
-        let f32buf = matmulF32xF32(xF32, weight.buffer, M: M, K: K, N: N)
-        if let bias {
-            addBiasF32(f32buf, bias: bias, M: M, N: N)
-        }
-        return f32buf
+        return applyF32in(xF32, M: M)
     }
 
-    /// f32 input × f32 weight → f32 output.
+    /// f32 input × weight → f32 output. Weight can be bf16 or f32.
     public func applyF32in(_ x: MTLBuffer, M: Int) -> MTLBuffer {
-        let f32buf = matmulF32xF32(x, weight.buffer, M: M, K: K, N: N)
+        let f32buf: MTLBuffer
+        switch weight.dtype {
+        case .bfloat16:
+            f32buf = matmulF32xBF16(x, weight.buffer, M: M, K: K, N: N)
+        default:
+            f32buf = matmulF32xF32(x, weight.buffer, M: M, K: K, N: N)
+        }
         if let biasF32 {
             addBiasF32F32(f32buf, bias: biasF32, M: M, N: N)
         }
@@ -200,7 +202,8 @@ public struct DiTWeights {
     public let adalnLinear: DiTLinear                // [dim, numParams*dim]
     public let captionProj1: DiTLinear?              // [4096, dim]
     public let captionProj2: DiTLinear?              // [dim, dim]
-    public let blocks: [DiTBlockWeights]
+    public let blockCount: Int
+    public let loadBlock: (Int) -> DiTBlockWeights   // lazy: loads from mmap on demand
     public let normOut: DiTLayerNormWeights
     public let scaleShiftTable: Tensor               // [2, dim] f16
     public let projOut: DiTLinear                    // [dim, outChannels]
@@ -470,7 +473,7 @@ func transposeNLCtoNC(_ x: Tensor, B: Int, C: Int, spatial: Int) -> Tensor {
 /// Transpose [B, C, S] → [B, S, C] f32
 func transposeNCtoNLCF32(_ x: MTLBuffer, B: Int, C: Int, spatial: Int) -> MTLBuffer {
     let count = B * C * spatial
-    let out = MetalContext.shared.device.makeBuffer(length: count * 4, options: .storageModeShared)!
+    let out = MetalContext.shared.bufferPool.get(length: count * 4)
     var c = UInt32(C), s = UInt32(spatial)
     let pipe = KernelCache.shared.pipeline("transpose_cs_f32")
     MetalContext.shared.run { enc in
@@ -488,7 +491,7 @@ func transposeNCtoNLCF32(_ x: MTLBuffer, B: Int, C: Int, spatial: Int) -> MTLBuf
 /// Transpose [B, S, C] → [B, C, S] f32
 func transposeNLCtoNCF32(_ x: MTLBuffer, B: Int, C: Int, spatial: Int) -> MTLBuffer {
     let count = B * C * spatial
-    let out = MetalContext.shared.device.makeBuffer(length: count * 4, options: .storageModeShared)!
+    let out = MetalContext.shared.bufferPool.get(length: count * 4)
     var c = UInt32(C), s = UInt32(spatial)
     let pipe = KernelCache.shared.pipeline("transpose_sc_f32")
     MetalContext.shared.run { enc in
@@ -536,7 +539,7 @@ public func elemAddScaled2(_ a: Tensor, _ b: Tensor, scaleA: Float, scaleB: Floa
 
 /// out = scaleA * a + scaleB * b (f32)
 public func elemAddScaled2F32(_ a: MTLBuffer, _ b: MTLBuffer, scaleA: Float, scaleB: Float, count: Int) -> MTLBuffer {
-    let out = MetalContext.shared.device.makeBuffer(length: count * 4, options: .storageModeShared)!
+    let out = MetalContext.shared.bufferPool.get(length: count * 4)
     var sA = scaleA, sB = scaleB
     let pipe = KernelCache.shared.pipeline("add_scaled2_f32")
     MetalContext.shared.run { enc in
@@ -554,7 +557,7 @@ public func elemAddScaled2F32(_ a: MTLBuffer, _ b: MTLBuffer, scaleA: Float, sca
 
 /// out = a + scale * b (f32)
 public func elemAddScaledF32(_ a: MTLBuffer, _ b: MTLBuffer, scale: Float, count: Int) -> MTLBuffer {
-    let out = MetalContext.shared.device.makeBuffer(length: count * 4, options: .storageModeShared)!
+    let out = MetalContext.shared.bufferPool.get(length: count * 4)
     var s = scale
     let pipe = KernelCache.shared.pipeline("add_scaled_f32")
     MetalContext.shared.run { enc in
@@ -659,20 +662,28 @@ public class DiTModel {
             flog?("captionProj2(f32): \(f32Stats(projected2, count: B * textSeqLen * cp2.N))")
         }
 
-        // 4. Transformer blocks — all f32
-        for (i, block) in weights.blocks.enumerated() {
-            hiddenF32 = transformerBlock(
-                hiddenF32, block: block,
-                cosFreqs: cosFreqs, sinFreqs: sinFreqs,
-                encoderHiddenStates: encoderStatesF32,
-                encoderCount: encoderStatesF32.map { $0.length / 4 } ?? 0,
-                timestepEmbF32: timestepEmbF32,
-                B: B, numTokens: numTokens,
-                blockIdx: i)
-            flog?("block\(i) out(f32): \(f32Stats(hiddenF32, count: count))")
-            pool.reset(keeping: [hiddenF32, hiddenStatesF32, timestepEmbF32,
-                                 embeddedTimestepF32, cosFreqs, sinFreqs]
-                       + (encoderStatesF32.map { [$0] } ?? []))
+        // 4. Transformer blocks — all f32, stream weights from mmap
+        flog?("[MEM] pre-blocks Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB")
+        for i in 0..<weights.blockCount {
+            autoreleasepool {
+                let block = weights.loadBlock(i)
+                flog?("[MEM] block\(i) loaded Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB")
+                hiddenF32 = transformerBlock(
+                    hiddenF32, block: block,
+                    cosFreqs: cosFreqs, sinFreqs: sinFreqs,
+                    encoderHiddenStates: encoderStatesF32,
+                    encoderCount: encoderStatesF32.map { $0.length / 4 } ?? 0,
+                    timestepEmbF32: timestepEmbF32,
+                    B: B, numTokens: numTokens,
+                    blockIdx: i)
+                flog?("[MEM] block\(i) computed Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB")
+                pool.reset(keeping: [hiddenF32, hiddenStatesF32, timestepEmbF32,
+                                     embeddedTimestepF32, cosFreqs, sinFreqs]
+                           + (encoderStatesF32.map { [$0] } ?? []))
+                // block dropped here — autoreleasepool forces immediate Metal buffer dealloc
+            }
+            let s = pool.stats
+            flog?("[MEM] block\(i) freed Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB pool: act=\(s.active/1024)KB/\(s.activeCount) free=\(s.free/1024)KB/\(s.freeCount)")
         }
 
         // 5. Output — all f32, return f32 directly
@@ -863,7 +874,7 @@ public class DiTModel {
             let innerDim = projN / 2
             let halfCount = M * innerDim
             // GEGLU f32: gelu(second half) * first half, using buffer offset for the split
-            let out = MetalContext.shared.device.makeBuffer(length: halfCount * 4, options: .storageModeShared)!
+            let out = MetalContext.shared.bufferPool.get(length: halfCount * 4)
             let pipe = KernelCache.shared.pipeline("geglu_f32")
             MetalContext.shared.run { enc in
                 enc.setComputePipelineState(pipe)
@@ -895,7 +906,7 @@ public class DiTModel {
     private func computeAdaLNParamsF32(_ tsEmbF32: MTLBuffer, table: Tensor,
                                         B: Int, dim: Int, numParams: Int) -> AdaLNParams {
         let totalCount = numParams * B * dim
-        let outBuf = MetalContext.shared.device.makeBuffer(length: totalCount * 4, options: .storageModeShared)!
+        let outBuf = MetalContext.shared.bufferPool.get(length: totalCount * 4)
         var dU = UInt32(dim), nU = UInt32(numParams), bU = UInt32(B)
         let pipe = KernelCache.shared.pipeline("ada_ln_params_all_f32")
         MetalContext.shared.run { enc in
@@ -1014,7 +1025,12 @@ public class LTXPipeline {
         }
         log?("timesteps: \(scheduler.timesteps.prefix(5))...")
 
-        let noiseData = try! Data(contentsOf: URL(fileURLWithPath: "/Users/zimski/Downloads/mlx_noise_f32.bin"))
+        #if os(macOS)
+        let noisePath = NSString(string: "~/projects/oss/swift-llm/fixtures/mlx_noise_f32.bin").expandingTildeInPath
+        #else
+        let noisePath = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true)[0] + "/mlx_noise_f32.bin"
+        #endif
+        let noiseData = try! Data(contentsOf: URL(fileURLWithPath: noisePath))
         let noiseCount = noiseData.count / 4
         let noiseF32 = noiseData.withUnsafeBytes { ptr in
             MetalContext.shared.device.makeBuffer(bytes: ptr.baseAddress!, length: ptr.count, options: .storageModeShared)!
@@ -1042,10 +1058,6 @@ public class LTXPipeline {
             let t = scheduler.timesteps[i]
             let tsTensor = Tensor([t], shape: [B])
 
-            let ctx = MetalContext.shared
-            let debugging = model.forwardLog != nil
-            if !debugging { ctx.beginBatch() }
-
             let noisePredF32 = model.forward(
                 hiddenStatesF32: tokensF32,
                 cosFreqs: cosFreqs, sinFreqs: sinFreqs,
@@ -1053,12 +1065,11 @@ public class LTXPipeline {
                 timestep: tsTensor,
                 B: B, numTokens: numTokens)
 
-            if !debugging { ctx.endBatch() }
-
+            log?("[MEM] step\(i) post-fwd Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB")
             log?("step \(i) t=\(String(format:"%.4f",t)) pred_f32: \(f32Stats(noisePredF32, count: tokenCount)) tokens_in_f32: \(f32Stats(tokensF32, count: tokenCount))")
             tokensF32 = scheduler.stepF32(modelOutput: noisePredF32, timestepIndex: i, sample: tokensF32, count: tokenCount)
             pool.reset(keeping: [tokensF32, cosFreqs, sinFreqs, textEmbeddings.buffer])
-            log?("step \(i) tokens_out_f32: \(f32Stats(tokensF32, count: tokenCount))")
+            log?("[MEM] step\(i) post-reset Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB")
 
             if i == 0 { model.forwardLog = nil }
             progressHandler?(i + 1, scheduler.timesteps.count)
@@ -1116,17 +1127,12 @@ public class LTXPipeline {
             let t = explicitTimesteps[i]
             let tsTensor = Tensor([t], shape: [B])
 
-            let ctx = MetalContext.shared
-            ctx.beginBatch()
-
             let noisePredF32 = model.forward(
                 hiddenStatesF32: tokensF32,
                 cosFreqs: cosFreqs, sinFreqs: sinFreqs,
                 encoderHiddenStates: textEmbeddings,
                 timestep: tsTensor,
                 B: B, numTokens: numTokens)
-
-            ctx.endBatch()
 
             log?("pass2 step \(i) t=\(String(format:"%.4f",t)) pred_f32: \(f32Stats(noisePredF32, count: tokenCount))")
             tokensF32 = scheduler.stepF32(modelOutput: noisePredF32, timestepIndex: i, sample: tokensF32, count: tokenCount)
@@ -1306,8 +1312,34 @@ public func loadDiTWeights(from url: URL, config: LTXTransformerConfig = LTXTran
         return Tensor(buffer: buf, shape: t.shape, dtype: .float16)
     }
 
+    /// Load a tensor in its native format (bf16 stays bf16, f16 stays f16, f32 stays f32).
+    /// Zero conversion — just copy raw bytes into an MTLBuffer.
+    func loadNative(_ name: String) -> Tensor? {
+        let remapped = remap(name)
+        let prefixed = "model.diffusion_model." + name
+        for file in files {
+            for tryName in [name, remapped, prefixed] {
+                if let info = file.tensors[tryName], let ptr = file.pointer(for: tryName) {
+                    let buf = MetalContext.shared.device.makeBuffer(bytes: ptr, length: info.byteCount, options: .storageModeShared)!
+                    let dtype: TensorDType
+                    switch info.dtype {
+                    case .bfloat16: dtype = .bfloat16
+                    case .float16:  dtype = .float16
+                    case .float32:  dtype = .float32
+                    default: return nil
+                    }
+                    return Tensor(buffer: buf, shape: info.shape, dtype: dtype)
+                }
+            }
+        }
+        return nil
+    }
+
     func loadLinear(prefix: String, K: Int, N: Int, bias: Bool = true) throws -> DiTLinear {
-        let w = try loadRequired("\(prefix).weight")  // f32
+        // Load weight in native format (bf16 stays bf16 — halves memory)
+        guard let w = loadNative("\(prefix).weight") else {
+            throw DiTLoadError.missingWeight("\(prefix).weight")
+        }
         let b = bias ? loadAsF16("\(prefix).bias") : nil  // f16
         return DiTLinear(weight: w, bias: b, K: K, N: N)
     }
@@ -1368,24 +1400,120 @@ public func loadDiTWeights(from url: URL, config: LTXTransformerConfig = LTXTran
         cp1 = nil; cp2 = nil
     }
 
-    // Transformer blocks
-    var blocks = [DiTBlockWeights]()
-    for i in 0..<config.numLayers {
+    // Transformer blocks — lazy loader. Opens a fresh mmap per block, copies weights,
+    // then lets the mmap go out of scope so macOS can reclaim pages.
+    // Only captures: url, dim, config, remap function (no SafeTensorsFile reference).
+    let tensorIndex = files[0].tensors  // just the metadata dictionary (lightweight)
+
+    // Parse header once (no mmap), reuse for all block loads
+    let index = try! SafeTensorsIndex(url: url)
+
+    let blockLoader: (Int) -> DiTBlockWeights = { i in
         let prefix = "transformer_blocks.\(i)"
+
+        func resolve(_ name: String) -> String? {
+            let remapped = remap(name)
+            let prefixed = "model.diffusion_model." + name
+            for tryName in [name, remapped, prefixed] {
+                if index.tensors[tryName] != nil { return tryName }
+            }
+            return nil
+        }
+
+        // Read tensor directly into Metal buffer via POSIX read (no mmap, no Data)
+        func blkLoadNative(_ name: String) -> Tensor? {
+            guard let resolved = resolve(name),
+                  let info = index.tensors[resolved],
+                  let buf = index.readTensorIntoBuffer(resolved) else { return nil }
+            let dtype: TensorDType
+            switch info.dtype {
+            case .bfloat16: dtype = .bfloat16
+            case .float16:  dtype = .float16
+            case .float32:  dtype = .float32
+            default: return nil
+            }
+            return Tensor(buffer: buf, shape: info.shape, dtype: dtype)
+        }
+
+        func blkLoadAsF16(_ name: String) -> Tensor? {
+            guard let resolved = resolve(name),
+                  let info = index.tensors[resolved] else { return nil }
+            let count = info.shape.reduce(1, *)
+            let ctx = MetalContext.shared
+            switch info.dtype {
+            case .float16:
+                // Direct read into final buffer
+                guard let buf = index.readTensorIntoBuffer(resolved) else { return nil }
+                return Tensor(buffer: buf, shape: info.shape, dtype: .float16)
+            case .bfloat16:
+                // Read raw into heap, convert into Metal buffer, free heap
+                let raw = UnsafeMutablePointer<UInt16>.allocate(capacity: count)
+                defer { raw.deallocate() }
+                guard index.readTensorRaw(resolved, into: raw) else { return nil }
+                let buf = ctx.device.makeBuffer(length: count * 2, options: .storageModeShared)!
+                let dst = buf.contents().assumingMemoryBound(to: Float16.self)
+                for j in 0..<count { dst[j] = Float16(Float(bitPattern: UInt32(raw[j]) << 16)) }
+                return Tensor(buffer: buf, shape: info.shape, dtype: .float16)
+            case .float32:
+                let raw = UnsafeMutablePointer<Float>.allocate(capacity: count)
+                defer { raw.deallocate() }
+                guard index.readTensorRaw(resolved, into: raw) else { return nil }
+                let buf = ctx.device.makeBuffer(length: count * 2, options: .storageModeShared)!
+                let dst = buf.contents().assumingMemoryBound(to: Float16.self)
+                for j in 0..<count { dst[j] = Float16(raw[j]) }
+                return Tensor(buffer: buf, shape: info.shape, dtype: .float16)
+            default:
+                return nil
+            }
+        }
+
+        func blkLoadLinear(_ prefix: String, K: Int, N: Int, bias: Bool = true) -> DiTLinear {
+            let w = blkLoadNative("\(prefix).weight")!
+            let b = bias ? blkLoadAsF16("\(prefix).bias") : nil
+            return DiTLinear(weight: w, bias: b, K: K, N: N)
+        }
+
+        func blkLoadRMSNorm(_ prefix: String) -> DiTRMSNormWeights {
+            guard let resolved = resolve("\(prefix).weight"),
+                  let info = index.tensors[resolved] else {
+                fatalError("Missing RMSNorm weight: \(prefix).weight")
+            }
+            let count = info.shape.reduce(1, *)
+            let ctx = MetalContext.shared
+            let buf: MTLBuffer
+            if info.dtype == .float32 {
+                // Direct read into final buffer
+                buf = index.readTensorIntoBuffer(resolved)!
+            } else if info.dtype == .bfloat16 {
+                let raw = UnsafeMutablePointer<UInt16>.allocate(capacity: count)
+                defer { raw.deallocate() }
+                _ = index.readTensorRaw(resolved, into: raw)
+                buf = ctx.device.makeBuffer(length: count * 4, options: .storageModeShared)!
+                let dst = buf.contents().assumingMemoryBound(to: Float.self)
+                for j in 0..<count { dst[j] = Float(bitPattern: UInt32(raw[j]) << 16) }
+            } else {
+                let raw = UnsafeMutablePointer<Float16>.allocate(capacity: count)
+                defer { raw.deallocate() }
+                _ = index.readTensorRaw(resolved, into: raw)
+                buf = ctx.device.makeBuffer(length: count * 4, options: .storageModeShared)!
+                let dst = buf.contents().assumingMemoryBound(to: Float.self)
+                for j in 0..<count { dst[j] = Float(raw[j]) }
+            }
+            return DiTRMSNormWeights(weight: Tensor(buffer: buf, shape: info.shape, dtype: .float32))
+        }
 
         // norm1/norm2 are not in the safetensors — they use default weight=1
         let norm1 = DiTRMSNormWeights(weight: Tensor([Float](repeating: 1.0, count: dim), shape: [dim]))
 
-        // Self-attention
-        let selfAttnQ = try loadLinear(prefix: "\(prefix).attn1.to_q", K: dim, N: dim)
-        let selfAttnK = try loadLinear(prefix: "\(prefix).attn1.to_k", K: dim, N: dim)
-        let selfAttnV = try loadLinear(prefix: "\(prefix).attn1.to_v", K: dim, N: dim)
-        let selfAttnOut = try loadLinear(prefix: "\(prefix).attn1.to_out.0", K: dim, N: dim)
+        let selfAttnQ = blkLoadLinear("\(prefix).attn1.to_q", K: dim, N: dim)
+        let selfAttnK = blkLoadLinear("\(prefix).attn1.to_k", K: dim, N: dim)
+        let selfAttnV = blkLoadLinear("\(prefix).attn1.to_v", K: dim, N: dim)
+        let selfAttnOut = blkLoadLinear("\(prefix).attn1.to_out.0", K: dim, N: dim)
         let qNorm: DiTRMSNormWeights?
         let kNorm: DiTRMSNormWeights?
         if config.qkNorm {
-            qNorm = try loadRMSNorm(prefix: "\(prefix).attn1.q_norm")
-            kNorm = try loadRMSNorm(prefix: "\(prefix).attn1.k_norm")
+            qNorm = blkLoadRMSNorm("\(prefix).attn1.q_norm")
+            kNorm = blkLoadRMSNorm("\(prefix).attn1.k_norm")
         } else {
             qNorm = nil; kNorm = nil
         }
@@ -1396,18 +1524,17 @@ public func loadDiTWeights(from url: URL, config: LTXTransformerConfig = LTXTran
 
         let norm2 = DiTRMSNormWeights(weight: Tensor([Float](repeating: 1.0, count: dim), shape: [dim]))
 
-        // Cross-attention
         var crossAttn: DiTAttentionWeights? = nil
         if config.crossAttentionDim > 0 {
-            let crossQ = try loadLinear(prefix: "\(prefix).attn2.to_q", K: dim, N: dim)
-            let crossK = try loadLinear(prefix: "\(prefix).attn2.to_k", K: config.crossAttentionDim, N: dim)
-            let crossV = try loadLinear(prefix: "\(prefix).attn2.to_v", K: config.crossAttentionDim, N: dim)
-            let crossOut = try loadLinear(prefix: "\(prefix).attn2.to_out.0", K: dim, N: dim)
+            let crossQ = blkLoadLinear("\(prefix).attn2.to_q", K: dim, N: dim)
+            let crossK = blkLoadLinear("\(prefix).attn2.to_k", K: config.crossAttentionDim, N: dim)
+            let crossV = blkLoadLinear("\(prefix).attn2.to_v", K: config.crossAttentionDim, N: dim)
+            let crossOut = blkLoadLinear("\(prefix).attn2.to_out.0", K: dim, N: dim)
             let crossQNorm: DiTRMSNormWeights?
             let crossKNorm: DiTRMSNormWeights?
             if config.qkNorm {
-                crossQNorm = try loadRMSNorm(prefix: "\(prefix).attn2.q_norm")
-                crossKNorm = try loadRMSNorm(prefix: "\(prefix).attn2.k_norm")
+                crossQNorm = blkLoadRMSNorm("\(prefix).attn2.q_norm")
+                crossKNorm = blkLoadRMSNorm("\(prefix).attn2.k_norm")
             } else {
                 crossQNorm = nil; crossKNorm = nil
             }
@@ -1416,24 +1543,20 @@ public func loadDiTWeights(from url: URL, config: LTXTransformerConfig = LTXTran
                 qNorm: crossQNorm, kNorm: crossKNorm, useRope: true, isCrossAttention: true)
         }
 
-        // FFN
         let isGeglu = config.activationFn == "geglu"
-        // For GEGLU: proj goes to innerDim*2, for plain GELU: proj goes to innerDim
         let innerDim = dim * 4
         let ffProjN = isGeglu ? innerDim * 2 : innerDim
-        let ffProj = try loadLinear(prefix: "\(prefix).ff.net.0.proj", K: dim, N: ffProjN)
-        let ffProjOut = try loadLinear(prefix: "\(prefix).ff.net.2", K: innerDim, N: dim)
+        let ffProj = blkLoadLinear("\(prefix).ff.net.0.proj", K: dim, N: ffProjN)
+        let ffProjOut = blkLoadLinear("\(prefix).ff.net.2", K: innerDim, N: dim)
         let ff = DiTFFNWeights(proj: ffProj, projOut: ffProjOut, isGeglu: isGeglu)
 
-        // Scale-shift table
         let numParams = config.adaptiveNorm == "single_scale" ? 4 : 6
-        guard let table = loadAsF16("\(prefix).scale_shift_table") else {
-            throw DiTLoadError.missingWeight("\(prefix).scale_shift_table")
-        }
+        let table = blkLoadAsF16("\(prefix).scale_shift_table")!
 
-        blocks.append(DiTBlockWeights(
+        return DiTBlockWeights(
             norm1: norm1, attn1: selfAttn, norm2: norm2, attn2: crossAttn,
-            ff: ff, scaleShiftTable: table, numAdaParams: numParams))
+            ff: ff, scaleShiftTable: table, numAdaParams: numParams)
+        // No mmap — all reads via POSIX read() into Metal buffers
     }
 
     // Output — norm_out uses default weight=1, bias=0 (not in safetensors)
@@ -1463,7 +1586,8 @@ public func loadDiTWeights(from url: URL, config: LTXTransformerConfig = LTXTran
         adalnLinear: adalnLinear,
         captionProj1: cp1,
         captionProj2: cp2,
-        blocks: blocks,
+        blockCount: config.numLayers,
+        loadBlock: blockLoader,
         normOut: normOut,
         scaleShiftTable: scaleShiftTable,
         projOut: projOut,

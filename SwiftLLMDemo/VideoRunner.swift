@@ -16,18 +16,16 @@ final class VideoRunner: ObservableObject {
     @Published var vaePath = NSString(string: "~/Downloads/ltxv_vae_decoder_f16.safetensors").expandingTildeInPath
     @Published var upsamplerPath = NSString(string: "~/Downloads/ltxv-spatial-upscaler-0.9.8.safetensors").expandingTildeInPath
     #else
-    @Published var ditPath = ""
-    @Published var embeddingsPath = ""
-    @Published var vaePath = ""
-    @Published var upsamplerPath = ""
+    @Published var ditPath = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true)[0] + "/ltxv_dit_bf16.safetensors"
+    @Published var embeddingsPath = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true)[0] + "/t5_embed_a_cat_walking_on_a_sunny_beach.safetensors"
+    @Published var vaePath = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true)[0] + "/ltxv_vae_decoder_f16.safetensors"
+    @Published var upsamplerPath = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true)[0] + "/ltxv-spatial-upscaler-0.9.8.safetensors"
     #endif
 
     @Published var numFrames: Int = 2
     @Published var height: Int = 24
     @Published var width: Int = 24
     @Published var seed: UInt64 = 42
-
-    private var vaeDecoder: VAEDecoder?
 
     var deviceName: String { MetalContext.shared.device.name }
 
@@ -44,52 +42,27 @@ final class VideoRunner: ObservableObject {
         return pipeline
     }
 
-    func loadModels() {
-        guard !isRunning else { return }
-        isRunning = true
-        statusText = "Loading VAE..."
-        debugLog = ""
-
-        let vaePth = vaePath
-
-        Thread.detachNewThread { [weak self] in
-            guard let self else { return }
-            do {
-                let start = CFAbsoluteTimeGetCurrent()
-
-                // Load VAE only (small, kept resident)
-                let vaeURL = URL(fileURLWithPath: vaePth)
-                let vaeFile = try SafeTensorsFile(url: vaeURL)
-                let prefix: String
-                if vaeFile.tensors.keys.contains(where: { $0.hasPrefix("decoder.") }) {
-                    prefix = "decoder."
-                } else if vaeFile.tensors.keys.contains(where: { $0.hasPrefix("vae.decoder.") }) {
-                    prefix = "vae.decoder."
-                } else {
-                    throw VideoRunnerError.noDecoderKeys
-                }
-                let vaeDecoder = try VAEDecoder(file: vaeFile, prefix: prefix)
-                let vaeTime = CFAbsoluteTimeGetCurrent() - start
-
-                let msg = String(format: "VAE loaded in %.1fs\n", vaeTime)
-                DispatchQueue.main.async { [weak self] in
-                    self?.vaeDecoder = vaeDecoder
-                    self?.debugLog += msg
-                    self?.statusText = String(format: "VAE loaded (%.1fs). DiT loaded on demand per stage.", vaeTime)
-                    self?.isRunning = false
-                }
-            } catch {
-                DispatchQueue.main.async { [weak self] in
-                    self?.statusText = "Error: \(error)"
-                    self?.isRunning = false
-                }
-            }
+    /// Load VAE decoder on demand.
+    nonisolated private func loadVAEDecoder(vaePath: String, log: ((String) -> Void)? = nil) throws -> VAEDecoder {
+        let start = CFAbsoluteTimeGetCurrent()
+        let vaeURL = URL(fileURLWithPath: vaePath)
+        let vaeFile = try SafeTensorsFile(url: vaeURL)
+        let prefix: String
+        if vaeFile.tensors.keys.contains(where: { $0.hasPrefix("decoder.") }) {
+            prefix = "decoder."
+        } else if vaeFile.tensors.keys.contains(where: { $0.hasPrefix("vae.decoder.") }) {
+            prefix = "vae.decoder."
+        } else {
+            throw VideoRunnerError.noDecoderKeys
         }
+        let vae = try VAEDecoder(file: vaeFile, prefix: prefix)
+        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        log?(String(format: "VAE loaded in %.1fs", elapsed))
+        return vae
     }
 
     func generate() {
         guard !isRunning else { return }
-        guard let vaeDecoder else { statusText = "Load VAE first"; return }
 
         let embPath = embeddingsPath
         guard !embPath.isEmpty else { statusText = "Set embeddings path"; return }
@@ -106,6 +79,7 @@ final class VideoRunner: ObservableObject {
         let s = seed
         let upPath = upsamplerPath
         let ditPth = ditPath
+        let vaePth = vaePath
 
         // Distilled model timesteps (from LTX-Video config)
         let pass1Timesteps: [Float] = [1.0, 0.9937, 0.9875, 0.9812, 0.9750, 0.9094, 0.7250]
@@ -117,7 +91,8 @@ final class VideoRunner: ObservableObject {
                 var log = ""
                 let start = CFAbsoluteTimeGetCurrent()
 
-                func updateLog(_ msg: String) {
+                func updateLog(_ msg: String, mem: Bool = false) {
+                    guard mem || msg.contains("[MEM]") else { return }
                     log += msg + "\n"
                     let snap = log
                     DispatchQueue.main.async { [weak self] in self?.debugLog = snap }
@@ -179,15 +154,13 @@ final class VideoRunner: ObservableObject {
                 // === Stage 1: Load DiT → Pass 1 → Release DiT ===
                 let latentC = 128  // config.outChannels
                 let pass1Count = 1 * latentC * nFrames * pass1H * pass1W
-                let pass1F32: MTLBuffer
-                do {
+                let pass1F32: MTLBuffer = autoreleasepool {
                     updateStatus("Loading DiT for Pass 1...")
-                    let pipeline = try self.loadDiTPipeline(ditPath: ditPth) { msg in updateLog(msg) }
+                    var pipeline: LTXPipeline? = try! self.loadDiTPipeline(ditPath: ditPth) { msg in updateLog(msg) }
 
                     updateStatus("Pass 1 denoising...")
-                    updateLog("=== Pass 1: \(nFrames)f × \(pass1H)×\(pass1W) ===")
                     let ditStart = CFAbsoluteTimeGetCurrent()
-                    pass1F32 = pipeline.generateLatents(
+                    let result = pipeline!.generateLatents(
                         textEmbeddings: textEmb,
                         textSeqLen: textSeqLen,
                         numFrames: nFrames,
@@ -205,79 +178,62 @@ final class VideoRunner: ObservableObject {
                         log: { msg in updateLog("  DiT: \(msg)") }
                     )
                     let ditTime = CFAbsoluteTimeGetCurrent() - ditStart
-                    updateLog(String(format: "Pass 1 done: %.2fs (%d steps)", ditTime, pass1Timesteps.count))
-                    updateLog("Pass 1 latents f32: \(f32Stats(pass1F32, count: pass1Count))")
-                    // pipeline goes out of scope here → ARC releases DiT weights
+                    updateLog(String(format: "Pass 1 done: %.2fs", ditTime))
+                    pipeline = nil
+                    return result
                 }
+                let dev = MetalContext.shared.device
+                updateLog(String(format: "S1 after autorelease: Metal=%dMB", dev.currentAllocatedSize/1048576), mem: true)
+                let s1 = MetalContext.shared.bufferPool.stats
+                updateLog(String(format: "S1 end: Metal=%dMB pool(act=%dMB/%d free=%dMB/%d)",
+                    dev.currentAllocatedSize/1048576, s1.active/1048576, s1.activeCount, s1.free/1048576, s1.freeCount), mem: true)
                 MetalContext.shared.bufferPool.releaseAll(keeping: [pass1F32])
-                updateLog("Released DiT weights + all intermediates after Pass 1")
+                updateLog(String(format: "S1 released: Metal=%dMB", dev.currentAllocatedSize/1048576), mem: true)
 
-                // DEBUG: skip upsampler+pass2, decode pass1 directly
-                let skipPass2 = false
-                if skipPass2 {
-                    let pass1F16 = castF32toF16(pass1F32, count: pass1Count, shape: [1, latentC, nFrames, pass1H, pass1W])
-                    let denormed = vaeDecoder.denormalize(pass1F16)
-                    updateLog("Denormalized pass1: \(f16Stats(denormed))")
-                    let noised = mixDecodeNoise(denormed, noiseScale: 0.025, seed: 0)
-                    updateStatus("VAE decoding (pass1 only)...")
-                    let output = vaeDecoder.decode(noised) { msg in updateLog("  VAE: \(msg)") }
-                    updateLog("Output: \(output.shape)")
-                    guard output.shape.count == 5 else {
-                        updateStatus("Error: VAE output shape \(output.shape)")
-                        DispatchQueue.main.async { [weak self] in self?.isRunning = false; self?.progress = nil }
-                        return
-                    }
-                    let frame = extractFirstFrame(from: output)
-                    updateLog("Frame: \(frame.width)x\(frame.height)")
-                    let totalTime = CFAbsoluteTimeGetCurrent() - start
-                    let finalLog = log
-                    DispatchQueue.main.async { [weak self] in
-                        self?.decodedImage = frame
-                        self?.debugLog = finalLog
-                        self?.statusText = String(format: "Done (pass1 only) %.1fs — %dx%d", totalTime, frame.width, frame.height)
-                        self?.isRunning = false; self?.progress = nil
-                    }
-                    return
-                }
-
-                // === Stage 2: Upsample + AdaIN (all f32) ===
+                // === Stage 2: Load VAE + Upsampler → Upsample + AdaIN → Release ALL ===
                 let upCount = 1 * latentC * nFrames * finalH * finalW
-                let adainedF32: MTLBuffer
-                do {
-                    updateStatus("Loading upsampler...")
+                let adainedF32: MTLBuffer = autoreleasepool {
+                    updateStatus("Loading VAE + upsampler...")
+                    let vae2 = try! self.loadVAEDecoder(vaePath: vaePth) { msg in updateLog(msg, mem: true) }
+                    updateLog(String(format: "S2 VAE loaded: Metal=%dMB", dev.currentAllocatedSize/1048576), mem: true)
+
                     let upStart = CFAbsoluteTimeGetCurrent()
-                    let upWeights = try loadUpsamplerWeights(from: URL(fileURLWithPath: upPath))
+                    let upWeights = try! loadUpsamplerWeights(from: URL(fileURLWithPath: upPath))
                     let upsampler = LatentUpsampler(weights: upWeights)
-                    updateLog(String(format: "Upsampler loaded in %.1fs", CFAbsoluteTimeGetCurrent() - upStart))
+                    updateLog(String(format: "Upsampler loaded in %.1fs, Metal=%dMB", CFAbsoluteTimeGetCurrent() - upStart, dev.currentAllocatedSize/1048576), mem: true)
 
                     updateStatus("Upsampling latents (f32)...")
-                    let denormedPass1F32 = vaeDecoder.denormalize(pass1F32, B: 1, C: latentC, F: nFrames, H: pass1H, W: pass1W)
-                    updateLog("Denormalized pass1 f32: \(f32Stats(denormedPass1F32, count: pass1Count))")
+                    let denormedPass1F32 = vae2.denormalize(pass1F32, B: 1, C: latentC, F: nFrames, H: pass1H, W: pass1W)
 
                     let upsampledF32 = upsampler.forward(denormedPass1F32, B: 1, F: nFrames, H: pass1H, W: pass1W) { msg in
                         updateLog("  Upsampler: \(msg)")
                     }
-                    updateLog("Upsampled f32: \(f32Stats(upsampledF32, count: upCount))")
 
-                    let renormedF32 = vaeDecoder.normalize(upsampledF32, B: 1, C: latentC, F: nFrames, H: finalH, W: finalW)
-                    updateLog("Re-normalized f32: \(f32Stats(renormedF32, count: upCount))")
+                    let renormedF32 = vae2.normalize(upsampledF32, B: 1, C: latentC, F: nFrames, H: finalH, W: finalW)
 
-                    adainedF32 = adainFilter(renormedF32, reference: pass1F32,
-                                                     B: 1, C: latentC,
-                                                     latShape: [1, latentC, nFrames, finalH, finalW],
-                                                     refShape: [1, latentC, nFrames, pass1H, pass1W],
-                                                     factor: 1.0)
-                    updateLog("AdaIN f32: \(f32Stats(adainedF32, count: upCount))")
-                    // upWeights, upsampler, denormedPass1F32, upsampledF32, renormedF32
-                    // all go out of scope here → ARC releases upsampler weights + intermediates
+                    let result = adainFilter(renormedF32, reference: pass1F32,
+                                             B: 1, C: latentC,
+                                             latShape: [1, latentC, nFrames, finalH, finalW],
+                                             refShape: [1, latentC, nFrames, pass1H, pass1W],
+                                             factor: 1.0)
+                    return result
+                    // vae2 + upsampler freed here
                 }
+                let s2 = MetalContext.shared.bufferPool.stats
+                updateLog(String(format: "S2 end: Metal=%dMB pool(act=%dMB/%d free=%dMB/%d)",
+                    dev.currentAllocatedSize/1048576, s2.active/1048576, s2.activeCount, s2.free/1048576, s2.freeCount), mem: true)
                 MetalContext.shared.bufferPool.releaseAll(keeping: [adainedF32])
-                updateLog("Released upsampler + all intermediates after Stage 2")
+                updateLog(String(format: "S2 released: Metal=%dMB", dev.currentAllocatedSize/1048576), mem: true)
 
                 // === Stage 3: Load DiT → Pass 2 → Release DiT ===
                 // Load MLX pass2 noise if available
                 var pass2NoiseOverride: MTLBuffer? = nil
-                let pass2NoiseURL = URL(fileURLWithPath: "/tmp/mlx_pass2_noise.safetensors")
+                #if os(macOS)
+                let pass2NoisePath = NSString(string: "~/projects/oss/swift-llm/fixtures/mlx_pass2_noise.safetensors").expandingTildeInPath
+                #else
+                let pass2NoisePath = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true)[0] + "/mlx_pass2_noise.safetensors"
+                #endif
+                let pass2NoiseURL = URL(fileURLWithPath: pass2NoisePath)
                 if FileManager.default.fileExists(atPath: pass2NoiseURL.path) {
                     let nf = try SafeTensorsFile(url: pass2NoiseURL)
                     let nk = nf.tensors.keys.first!
@@ -296,15 +252,13 @@ final class VideoRunner: ObservableObject {
                 }
 
                 let pass2Count = 1 * latentC * nFrames * finalH * finalW
-                let pass2F32: MTLBuffer
-                do {
+                let pass2F32: MTLBuffer = autoreleasepool {
                     updateStatus("Loading DiT for Pass 2...")
-                    let pipeline = try self.loadDiTPipeline(ditPath: ditPth) { msg in updateLog(msg) }
+                    var pipeline2: LTXPipeline? = try! self.loadDiTPipeline(ditPath: ditPth) { msg in updateLog(msg) }
 
                     updateStatus("Pass 2 denoising...")
-                    updateLog("=== Pass 2: \(nFrames)f × \(finalH)×\(finalW) ===")
                     let pass2Start = CFAbsoluteTimeGetCurrent()
-                    pass2F32 = pipeline.denoiseLatents(
+                    let result = pipeline2!.denoiseLatents(
                         inputLatentsF32: adainedF32,
                         B: 1, C: latentC, numFrames: nFrames, height: finalH, width: finalW,
                         textEmbeddings: textEmb,
@@ -322,15 +276,21 @@ final class VideoRunner: ObservableObject {
                         log: { msg in updateLog("  DiT: \(msg)") }
                     )
                     let pass2Time = CFAbsoluteTimeGetCurrent() - pass2Start
-                    updateLog(String(format: "Pass 2 done: %.2fs (%d steps)", pass2Time, pass2Timesteps.count))
-                    updateLog("Pass 2 latents f32: \(f32Stats(pass2F32, count: pass2Count))")
-                    // pipeline goes out of scope here → ARC releases DiT weights
+                    updateLog(String(format: "Pass 2 done: %.2fs", pass2Time))
+                    pipeline2 = nil
+                    return result
                 }
+                let s3 = MetalContext.shared.bufferPool.stats
+                updateLog(String(format: "S3 end: Metal=%dMB pool(act=%dMB/%d free=%dMB/%d)",
+                    dev.currentAllocatedSize/1048576, s3.active/1048576, s3.activeCount, s3.free/1048576, s3.freeCount), mem: true)
                 MetalContext.shared.bufferPool.releaseAll(keeping: [pass2F32])
-                updateLog("Released DiT weights after Pass 2")
+                updateLog(String(format: "S3 released: Metal=%dMB", dev.currentAllocatedSize/1048576), mem: true)
 
-                // === VAE decode (cast f32→f16 once) ===
-                updateLog("Casting to f16 for VAE...")
+                // === Stage 4: Load VAE → decode ===
+                updateStatus("Loading VAE for decode...")
+                let vaeDecoder = try self.loadVAEDecoder(vaePath: vaePth) { msg in updateLog(msg, mem: true) }
+                updateLog(String(format: "S4 VAE loaded: Metal=%dMB", dev.currentAllocatedSize/1048576), mem: true)
+
                 let finalF16 = castF32toF16(pass2F32, count: pass2Count, shape: [1, latentC, nFrames, finalH, finalW])
                 let denormed = vaeDecoder.denormalize(finalF16)
                 updateLog("Denormalized: \(f16Stats(denormed))")
@@ -395,7 +355,6 @@ final class VideoRunner: ObservableObject {
 
     func generateFromMLXAdaIN() {
         guard !isRunning else { return }
-        guard let vaeDecoder else { statusText = "Load VAE first"; return }
 
         isRunning = true
         statusText = "Loading MLX AdaIN latents..."
@@ -404,6 +363,7 @@ final class VideoRunner: ObservableObject {
 
         let embPath = embeddingsPath
         let ditPth = ditPath
+        let vaePth = vaePath
         let pass2Timesteps: [Float] = [0.9094, 0.7250, 0.4219]
 
         Thread.detachNewThread { [weak self] in
@@ -463,7 +423,12 @@ final class VideoRunner: ObservableObject {
 
                 // Load MLX pass2 noise if available
                 var noiseOverride: MTLBuffer? = nil
-                let noiseURL = URL(fileURLWithPath: "/tmp/mlx_pass2_noise.safetensors")
+                #if os(macOS)
+                let noiseURLPath = NSString(string: "~/projects/oss/swift-llm/fixtures/mlx_pass2_noise.safetensors").expandingTildeInPath
+                #else
+                let noiseURLPath = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true)[0] + "/mlx_pass2_noise.safetensors"
+                #endif
+                let noiseURL = URL(fileURLWithPath: noiseURLPath)
                 if FileManager.default.fileExists(atPath: noiseURL.path) {
                     let noiseFile = try SafeTensorsFile(url: noiseURL)
                     let noiseKey = noiseFile.tensors.keys.first!
@@ -501,7 +466,9 @@ final class VideoRunner: ObservableObject {
                 let pass2Count = B * latentC * nFrames * finalH * finalW
                 updateLog("Pass 2 latents f32: \(f32Stats(pass2F32, count: pass2Count))")
 
-                // VAE decode
+                // VAE decode — load on demand
+                updateStatus("Loading VAE...")
+                let vaeDecoder = try self.loadVAEDecoder(vaePath: vaePth) { msg in updateLog(msg) }
                 let finalF16 = castF32toF16(pass2F32, count: pass2Count, shape: [B, latentC, nFrames, finalH, finalW])
                 let denormed = vaeDecoder.denormalize(finalF16)
                 let noised = mixDecodeNoise(denormed, noiseScale: 0.025, seed: 0)

@@ -4,6 +4,7 @@ import SwiftLLM
 struct VideoView: View {
     @StateObject private var runner = VideoRunner()
     @State private var showDebug = true
+    @State private var didAutoStart = false
 
     var body: some View {
         NavigationStack {
@@ -165,15 +166,6 @@ struct VideoView: View {
                             .font(.system(size: 14, weight: .medium, design: .monospaced))
                             .foregroundStyle(.gray)
                     } else {
-                        Button(action: { runner.loadModels() }) {
-                            HStack {
-                                Image(systemName: "square.and.arrow.down")
-                                Text("Load")
-                            }
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.cyan)
-
                         Button(action: { runner.generate() }) {
                             HStack {
                                 Image(systemName: "play.fill")
@@ -202,6 +194,14 @@ struct VideoView: View {
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
+            .onAppear {
+                #if os(macOS)
+                if !didAutoStart {
+                    didAutoStart = true
+                    runner.generate()
+                }
+                #endif
+            }
         }
     }
 
