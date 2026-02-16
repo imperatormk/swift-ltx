@@ -731,9 +731,239 @@ public final class KernelCache: @unchecked Sendable {
             uint mr = tile_m + r;
             uint nc = tile_n + c;
             if (mr < M && nc < N) {
-                C[mr * N + nc] = half(out_f[r * 32 + c]);
+                float v = out_f[r * 32 + c];
+                v = clamp(v, -65504.0f, 65504.0f);
+                C[mr * N + nc] = half(v);
             }
         }
+    }
+
+    // GEMM with f32 output: C[M,N] = A[M,K] × B^T[N,K], A/B f16, C f32
+    kernel void simple_gemm_f16_f32out(
+        device const half* A [[buffer(0)]],
+        device const half* B [[buffer(1)]],
+        device float* C [[buffer(2)]],
+        constant uint& M [[buffer(3)]],
+        constant uint& N [[buffer(4)]],
+        constant uint& K [[buffer(5)]],
+        uint2 tgid [[threadgroup_position_in_grid]],
+        uint simd_id [[simdgroup_index_in_threadgroup]],
+        uint lane_id [[thread_index_in_simdgroup]],
+        threadgroup half* smem [[threadgroup(0)]])
+    {
+        uint tile_m = tgid.y * 32;
+        uint tile_n = tgid.x * 32;
+        uint flat_tid = simd_id * 32 + lane_id;
+
+        threadgroup half* A_smem = smem;
+        threadgroup half* BT_smem = smem + 32 * 8;
+
+        simdgroup_matrix<float, 8, 8> acc0(0), acc1(0), acc2(0), acc3(0);
+
+        for (uint k_start = 0; k_start < K; k_start += 8) {
+            for (uint i = flat_tid; i < 32 * 8; i += 128) {
+                uint r = i / 8, c = i % 8;
+                uint mr = tile_m + r, kc = k_start + c;
+                A_smem[r * 8 + c] = (mr < M && kc < K) ? A[mr * K + kc] : half(0);
+            }
+            for (uint i = flat_tid; i < 8 * 32; i += 128) {
+                uint kr = i / 32, nc = i % 32;
+                uint kc = k_start + kr, nr = tile_n + nc;
+                BT_smem[kr * 32 + nc] = (kc < K && nr < N) ? B[nr * K + kc] : half(0);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            simdgroup_matrix<half, 8, 8> a_tile;
+            simdgroup_load(a_tile, A_smem + simd_id * 8 * 8, 8);
+            simdgroup_matrix<half, 8, 8> bt0, bt1, bt2, bt3;
+            simdgroup_load(bt0, BT_smem + 0,  32);
+            simdgroup_load(bt1, BT_smem + 8,  32);
+            simdgroup_load(bt2, BT_smem + 16, 32);
+            simdgroup_load(bt3, BT_smem + 24, 32);
+
+            simdgroup_multiply_accumulate(acc0, a_tile, bt0, acc0);
+            simdgroup_multiply_accumulate(acc1, a_tile, bt1, acc1);
+            simdgroup_multiply_accumulate(acc2, a_tile, bt2, acc2);
+            simdgroup_multiply_accumulate(acc3, a_tile, bt3, acc3);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        threadgroup float* out_f = (threadgroup float*)smem;
+        simdgroup_store(acc0, out_f + simd_id * 8 * 32 + 0,  32);
+        simdgroup_store(acc1, out_f + simd_id * 8 * 32 + 8,  32);
+        simdgroup_store(acc2, out_f + simd_id * 8 * 32 + 16, 32);
+        simdgroup_store(acc3, out_f + simd_id * 8 * 32 + 24, 32);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = flat_tid; i < 32 * 32; i += 128) {
+            uint r = i / 32, c = i % 32;
+            uint mr = tile_m + r, nc = tile_n + c;
+            if (mr < M && nc < N) {
+                C[mr * N + nc] = out_f[r * 32 + c];
+            }
+        }
+    }
+
+    // Convert f32 → f16
+    // Per-channel scale+bias: out[i] = x[i] * scale[c] + bias[c]
+    // Layout: [B, C, spatial], tid = b*C*spatial + c*spatial + s
+    kernel void channel_scale_bias(
+        device const half* x [[buffer(0)]],
+        device const half* scale [[buffer(1)]],
+        device const half* bias [[buffer(2)]],
+        device half* out [[buffer(3)]],
+        constant uint& C [[buffer(4)]],
+        constant uint& spatial [[buffer(5)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        uint c = (tid / spatial) % C;
+        out[tid] = x[tid] * scale[c] + bias[c];
+    }
+
+    // Mix decode noise: out = x * (1 - scale) + noise * scale
+    kernel void mix_noise(
+        device const half* x [[buffer(0)]],
+        device const half* noise [[buffer(1)]],
+        device half* out [[buffer(2)]],
+        constant float& scale [[buffer(3)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        float v = float(x[tid]) * (1.0f - scale) + float(noise[tid]) * scale;
+        out[tid] = half(v);
+    }
+
+    kernel void cast_f32_to_f16(
+        device const float* src [[buffer(0)]],
+        device half* dst [[buffer(1)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        dst[tid] = half(clamp(src[tid], -65504.0f, 65504.0f));
+    }
+
+    // Element-wise add f32: out = a + b
+    kernel void elem_add_f32(
+        device const float* a [[buffer(0)]],
+        device const float* b [[buffer(1)]],
+        device float* out [[buffer(2)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        out[tid] = a[tid] + b[tid];
+    }
+
+    // In-place add f32: acc[i] += b[i]
+    kernel void elem_add_f32_inplace(
+        device float* acc [[buffer(0)]],
+        device const float* b [[buffer(1)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        acc[tid] += b[tid];
+    }
+
+    // Broadcast bias f32: out[row*N + col] = bias[col]  (add to existing)
+    kernel void broadcast_bias_add_f32(
+        device float* out [[buffer(0)]],
+        device const half* bias [[buffer(1)]],
+        constant uint& N [[buffer(2)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        uint col = tid % N;
+        out[tid] += float(bias[col]);
+    }
+
+    // f16 → f32
+    kernel void cast_f16_to_f32(
+        device const half* src [[buffer(0)]],
+        device float* dst [[buffer(1)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        dst[tid] = float(src[tid]);
+    }
+
+    // f32 = f32 + f16 (add f16 tensor to f32 accumulator)
+    kernel void elem_add_f32_f16(
+        device float* acc [[buffer(0)]],
+        device const half* x [[buffer(1)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        acc[tid] += float(x[tid]);
+    }
+
+    // f32 = f32 * f16 (element-wise multiply f32 by f16)
+    kernel void elem_mul_f32_f16(
+        device const float* a [[buffer(0)]],
+        device const half* b [[buffer(1)]],
+        device float* out [[buffer(2)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        out[tid] = a[tid] * float(b[tid]);
+    }
+
+    // RMS Norm with f32 input → f16 output.
+    // The norm normalizes values (divides by RMS), so output fits in f16 even when input is huge.
+    kernel void rms_norm_f32in(
+        device const float* x [[buffer(0)]],
+        device const float* weight [[buffer(1)]],
+        device half* out [[buffer(2)]],
+        constant uint& dim [[buffer(3)]],
+        constant float& eps [[buffer(4)]],
+        uint tg_id [[threadgroup_position_in_grid]],
+        uint tid_in_tg [[thread_index_in_threadgroup]],
+        uint tg_size [[threads_per_threadgroup]])
+    {
+        uint row = tg_id;
+        uint off = row * dim;
+        float sum_sq = 0;
+        for (uint i = tid_in_tg; i < dim; i += tg_size) {
+            float v = x[off + i];
+            sum_sq += v * v;
+        }
+        sum_sq += simd_shuffle_xor(sum_sq, 1);
+        sum_sq += simd_shuffle_xor(sum_sq, 2);
+        sum_sq += simd_shuffle_xor(sum_sq, 4);
+        sum_sq += simd_shuffle_xor(sum_sq, 8);
+        sum_sq += simd_shuffle_xor(sum_sq, 16);
+        threadgroup float shared[8];
+        uint simd_lane = tid_in_tg % 32;
+        uint simd_id = tid_in_tg / 32;
+        if (simd_lane == 0) shared[simd_id] = sum_sq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid_in_tg == 0) {
+            float total_sq = 0;
+            uint num_simds = (tg_size + 31) / 32;
+            for (uint i = 0; i < num_simds; i++) total_sq += shared[i];
+            shared[0] = rsqrt(total_sq / float(dim) + eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float rms = shared[0];
+        for (uint i = tid_in_tg; i < dim; i += tg_size) {
+            out[off + i] = half(x[off + i] * rms * weight[i]);
+        }
+    }
+
+    // AdaLN modulate with f32 input: out = x * (1 + scale) + shift
+    // x is f32 (residual stream), scale/shift are f16, output f16
+    kernel void adaln_modulate_f32in(
+        device const float* x [[buffer(0)]],
+        device const half* scale [[buffer(1)]],
+        device const half* shift [[buffer(2)]],
+        device half* out [[buffer(3)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        float v = x[tid];
+        float s = float(scale[tid]);
+        float sh = float(shift[tid]);
+        out[tid] = half(v * (1.0f + s) + sh);
+    }
+
+    // Element-wise: out = f32_input * f16_scale, output f16
+    // For (1+scale) path: scale is already (1+s), so just multiply
+    kernel void elem_mul_f32in_f16(
+        device const float* a [[buffer(0)]],
+        device const half* b [[buffer(1)]],
+        device half* out [[buffer(2)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        out[tid] = half(a[tid] * float(b[tid]));
     }
 
     // ========== VAE 3D Decoder Kernels ==========
@@ -1167,8 +1397,8 @@ public final class KernelCache: @unchecked Sendable {
         uint iw = ow / p;  // r index
         uint r = ow % p;
 
-        // Input channel = c * p * p + r * p + q
-        uint ic = c * p * p + r * p + q;
+        // Input channel = c * p * p + q * p + r  (q=row patch, r=col patch)
+        uint ic = c * p * p + q * p + r;
         uint in_idx = b * C_in * F * H_in * W_in + ic * F * H_in * W_in + f * H_in * W_in + ih * W_in + iw;
         output[tid] = input[in_idx];
     }
@@ -1357,9 +1587,12 @@ public final class KernelCache: @unchecked Sendable {
     {
         uint b = tid / C;
         uint c = tid % C;
-        uint base = b * 2 * C;
+        // FIX: was `base = b * 2 * C` and `tsEmb[base + C + c]` for out1,
+        // which read out-of-bounds when tsEmb is [B,C] (not [B,2C]).
+        // Both outputs should use the same tsEmb value, differing only by table row.
+        uint base = b * C;
         out0[tid] = half(float(table[c]) + float(tsEmb[base + c]));
-        out1[tid] = half(float(table[C + c]) + float(tsEmb[base + C + c]));
+        out1[tid] = half(float(table[C + c]) + float(tsEmb[base + c]));
     }
 
     // Repeat channels: [B, C, spatial] → [B, C*repeats, spatial]
@@ -1399,6 +1632,1052 @@ public final class KernelCache: @unchecked Sendable {
         uint d_out = rem / HW;
         uint hw = rem % HW;
         output[tid] = input[bc * D * HW + (from_offset + d_out) * HW + hw];
+    }
+
+    // GELU approximate (tanh): out = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    kernel void gelu_approximate(
+        device const half* x [[buffer(0)]],
+        device half* out [[buffer(1)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        float v = float(x[tid]);
+        float c = 0.7978845608f; // sqrt(2/pi)
+        float inner = c * (v + 0.044715f * v * v * v);
+        inner = clamp(inner, -10.0f, 10.0f);
+        out[tid] = half(0.5f * v * (1.0f + tanh(inner)));
+    }
+
+    // Fused GEGLU: out = gelu_approx(a) * b (f16 in/out)
+    kernel void geglu(
+        device const half* a [[buffer(0)]],
+        device const half* b [[buffer(1)]],
+        device half* out [[buffer(2)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        float v = float(a[tid]);
+        float c = 0.7978845608f;
+        float inner = c * (v + 0.044715f * v * v * v);
+        inner = clamp(inner, -10.0f, 10.0f);
+        float gelu = 0.5f * v * (1.0f + tanh(inner));
+        float result = gelu * float(b[tid]);
+        out[tid] = half(clamp(result, -65504.0f, 65504.0f));
+    }
+
+    // GELU approximate f32: reads f32, writes f32
+    kernel void gelu_approximate_f32(
+        device const float* x [[buffer(0)]],
+        device float* out [[buffer(1)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        float v = x[tid];
+        float c = 0.7978845608f;
+        float inner = c * (v + 0.044715f * v * v * v);
+        inner = clamp(inner, -10.0f, 10.0f);  // tanh saturates at ±10; avoids exp(2x) overflow → NaN
+        out[tid] = 0.5f * v * (1.0f + tanh(inner));
+    }
+
+    // Fused GEGLU f32: reads f32, writes f32
+    kernel void geglu_f32(
+        device const float* a [[buffer(0)]],
+        device const float* b [[buffer(1)]],
+        device float* out [[buffer(2)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        float v = a[tid];
+        float c = 0.7978845608f;
+        float inner = c * (v + 0.044715f * v * v * v);
+        float gelu = 0.5f * v * (1.0f + tanh(inner));
+        out[tid] = gelu * b[tid];
+    }
+
+    // Layer Norm: out[i] = (x[i] - mean) / sqrt(var + eps) * weight[i] + bias[i]
+    // weight/bias f16, accumulator f32.
+    // Grid: (rows) threadgroups, threadgroupSize threads each.
+    kernel void layer_norm(
+        device const half* x [[buffer(0)]],
+        device const half* ln_weight [[buffer(1)]],
+        device const half* ln_bias [[buffer(2)]],
+        device half* out [[buffer(3)]],
+        constant uint& dim [[buffer(4)]],
+        constant float& eps [[buffer(5)]],
+        uint tg_id [[threadgroup_position_in_grid]],
+        uint tid_in_tg [[thread_index_in_threadgroup]],
+        uint tg_size [[threads_per_threadgroup]])
+    {
+        uint row = tg_id;
+        uint off = row * dim;
+
+        // Pass 1: parallel sum and sum_sq
+        float local_sum = 0;
+        float local_sum_sq = 0;
+        for (uint i = tid_in_tg; i < dim; i += tg_size) {
+            float v = float(x[off + i]);
+            local_sum += v;
+            local_sum_sq += v * v;
+        }
+
+        // SIMD reduction
+        local_sum += simd_shuffle_xor(local_sum, 1);
+        local_sum += simd_shuffle_xor(local_sum, 2);
+        local_sum += simd_shuffle_xor(local_sum, 4);
+        local_sum += simd_shuffle_xor(local_sum, 8);
+        local_sum += simd_shuffle_xor(local_sum, 16);
+        local_sum_sq += simd_shuffle_xor(local_sum_sq, 1);
+        local_sum_sq += simd_shuffle_xor(local_sum_sq, 2);
+        local_sum_sq += simd_shuffle_xor(local_sum_sq, 4);
+        local_sum_sq += simd_shuffle_xor(local_sum_sq, 8);
+        local_sum_sq += simd_shuffle_xor(local_sum_sq, 16);
+
+        threadgroup float shared[16];
+        uint simd_lane = tid_in_tg % 32;
+        uint simd_id = tid_in_tg / 32;
+        if (simd_lane == 0) {
+            shared[simd_id * 2] = local_sum;
+            shared[simd_id * 2 + 1] = local_sum_sq;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid_in_tg == 0) {
+            float total_sum = 0, total_sum_sq = 0;
+            uint num_simds = (tg_size + 31) / 32;
+            for (uint i = 0; i < num_simds; i++) {
+                total_sum += shared[i * 2];
+                total_sum_sq += shared[i * 2 + 1];
+            }
+            float mean = total_sum / float(dim);
+            float variance = total_sum_sq / float(dim) - mean * mean;
+            shared[0] = mean;
+            shared[1] = rsqrt(variance + eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float mean = shared[0];
+        float inv_std = shared[1];
+
+        // Pass 2: normalize + weight + bias
+        for (uint i = tid_in_tg; i < dim; i += tg_size) {
+            float v = (float(x[off + i]) - mean) * inv_std;
+            out[off + i] = half(v * float(ln_weight[i]) + float(ln_bias[i]));
+        }
+    }
+
+    // Layer norm with f32 input → f16 output
+    kernel void layer_norm_f32in(
+        device const float* x [[buffer(0)]],
+        device const half* ln_weight [[buffer(1)]],
+        device const half* ln_bias [[buffer(2)]],
+        device half* out [[buffer(3)]],
+        constant uint& dim [[buffer(4)]],
+        constant float& eps [[buffer(5)]],
+        uint tg_id [[threadgroup_position_in_grid]],
+        uint tid_in_tg [[thread_index_in_threadgroup]],
+        uint tg_size [[threads_per_threadgroup]])
+    {
+        uint row = tg_id;
+        uint off = row * dim;
+        float local_sum = 0, local_sum_sq = 0;
+        for (uint i = tid_in_tg; i < dim; i += tg_size) {
+            float v = x[off + i];
+            local_sum += v;
+            local_sum_sq += v * v;
+        }
+        local_sum += simd_shuffle_xor(local_sum, 1);
+        local_sum += simd_shuffle_xor(local_sum, 2);
+        local_sum += simd_shuffle_xor(local_sum, 4);
+        local_sum += simd_shuffle_xor(local_sum, 8);
+        local_sum += simd_shuffle_xor(local_sum, 16);
+        local_sum_sq += simd_shuffle_xor(local_sum_sq, 1);
+        local_sum_sq += simd_shuffle_xor(local_sum_sq, 2);
+        local_sum_sq += simd_shuffle_xor(local_sum_sq, 4);
+        local_sum_sq += simd_shuffle_xor(local_sum_sq, 8);
+        local_sum_sq += simd_shuffle_xor(local_sum_sq, 16);
+        threadgroup float shared[16];
+        uint simd_lane = tid_in_tg % 32;
+        uint simd_id = tid_in_tg / 32;
+        if (simd_lane == 0) {
+            shared[simd_id * 2] = local_sum;
+            shared[simd_id * 2 + 1] = local_sum_sq;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid_in_tg == 0) {
+            float total_sum = 0, total_sum_sq = 0;
+            uint num_simds = (tg_size + 31) / 32;
+            for (uint i = 0; i < num_simds; i++) {
+                total_sum += shared[i * 2];
+                total_sum_sq += shared[i * 2 + 1];
+            }
+            float mean = total_sum / float(dim);
+            float variance = total_sum_sq / float(dim) - mean * mean;
+            shared[0] = mean;
+            shared[1] = rsqrt(variance + eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float mean = shared[0];
+        float inv_std = shared[1];
+        for (uint i = tid_in_tg; i < dim; i += tg_size) {
+            float v = (x[off + i] - mean) * inv_std;
+            out[off + i] = half(v * float(ln_weight[i]) + float(ln_bias[i]));
+        }
+    }
+
+    // Scale + gate: out = x * (1 + scale) + shift, then gated by gate
+    // For AdaLN single_scale_shift modulation.
+    // x: [N, dim], scale/shift/gate: [N, dim] (broadcast already expanded)
+    // Grid: total elements
+    kernel void adaln_modulate(
+        device const half* x [[buffer(0)]],
+        device const half* scale [[buffer(1)]],
+        device const half* shift [[buffer(2)]],
+        device half* out [[buffer(3)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        float v = float(x[tid]);
+        float s = float(scale[tid]);
+        float sh = float(shift[tid]);
+        out[tid] = half(v * (1.0f + s) + sh);
+    }
+
+    // Gate multiply: out = gate * x (element-wise)
+    // Same as mul but kept for clarity in DiT context.
+    kernel void gate_mul(
+        device const half* gate [[buffer(0)]],
+        device const half* x [[buffer(1)]],
+        device half* out [[buffer(2)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        out[tid] = half(float(gate[tid]) * float(x[tid]));
+    }
+
+    // 3D RoPE: apply precomputed cos/sin to input tensor.
+    // x: [B, seqLen, dim], cos/sin: [B, seqLen, dim]
+    // rotate_half pattern: pairs (x[2i], x[2i+1]) -> (x[2i]*cos - x[2i+1]*sin, x[2i]*sin + x[2i+1]*cos)
+    // Grid: (dim/2, B * seqLen)
+    kernel void rope_3d(
+        device const half* src [[buffer(0)]],
+        device half* dst [[buffer(1)]],
+        device const half* cos_freqs [[buffer(2)]],
+        device const half* sin_freqs [[buffer(3)]],
+        constant uint& dim [[buffer(4)]],
+        uint2 tid [[thread_position_in_grid]])
+    {
+        uint pair = tid.x;
+        uint bs = tid.y;  // batch * seqLen index
+
+        uint base = bs * dim;
+        uint freq_base = bs * dim;
+
+        uint i0 = pair * 2;
+        uint i1 = pair * 2 + 1;
+
+        float x0 = float(src[base + i0]);
+        float x1 = float(src[base + i1]);
+        float c = float(cos_freqs[freq_base + i0]);  // cos is repeat_interleaved
+        float s = float(sin_freqs[freq_base + i0]);
+
+        // rotate_half: (-x1, x0) for the pair
+        dst[base + i0] = half(x0 * c - x1 * s);
+        dst[base + i1] = half(x1 * c + x0 * s);
+    }
+
+    // Broadcast bias [N] to [M*N]: out[m*N+n] = bias[n]
+    kernel void broadcast_bias(
+        device const half* bias_in [[buffer(0)]],
+        device half* out [[buffer(1)]],
+        constant uint& N [[buffer(2)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        out[tid] = bias_in[tid % N];
+    }
+
+    // Transpose [B, C, S] → [B, S, C] (channel-first to channel-last)
+    // Grid: (C*S, B)
+    kernel void transpose_cs(
+        device const half* src [[buffer(0)]],
+        device half* dst [[buffer(1)]],
+        constant uint& C [[buffer(2)]],
+        constant uint& S [[buffer(3)]],
+        uint2 tid [[thread_position_in_grid]])
+    {
+        uint idx = tid.x;
+        uint b = tid.y;
+        uint c = idx / S;
+        uint s = idx % S;
+        if (c >= C) return;
+        dst[b * S * C + s * C + c] = src[b * C * S + c * S + s];
+    }
+
+    // Transpose [B, S, C] → [B, C, S] (channel-last to channel-first)
+    // Grid: (C*S, B)
+    kernel void transpose_sc(
+        device const half* src [[buffer(0)]],
+        device half* dst [[buffer(1)]],
+        constant uint& C [[buffer(2)]],
+        constant uint& S [[buffer(3)]],
+        uint2 tid [[thread_position_in_grid]])
+    {
+        uint idx = tid.x;
+        uint b = tid.y;
+        uint c = idx / S;
+        uint s = idx % S;
+        if (c >= C) return;
+        dst[b * C * S + c * S + s] = src[b * S * C + s * C + c];
+    }
+
+    // Transpose [B, C, S] → [B, S, C] f32
+    kernel void transpose_cs_f32(
+        device const float* src [[buffer(0)]],
+        device float* dst [[buffer(1)]],
+        constant uint& C [[buffer(2)]],
+        constant uint& S [[buffer(3)]],
+        uint2 tid [[thread_position_in_grid]])
+    {
+        uint idx = tid.x;
+        uint b = tid.y;
+        uint c = idx / S;
+        uint s = idx % S;
+        if (c >= C) return;
+        dst[b * S * C + s * C + c] = src[b * C * S + c * S + s];
+    }
+
+    // Transpose [B, S, C] → [B, C, S] f32
+    kernel void transpose_sc_f32(
+        device const float* src [[buffer(0)]],
+        device float* dst [[buffer(1)]],
+        constant uint& C [[buffer(2)]],
+        constant uint& S [[buffer(3)]],
+        uint2 tid [[thread_position_in_grid]])
+    {
+        uint idx = tid.x;
+        uint b = tid.y;
+        uint c = idx / S;
+        uint s = idx % S;
+        if (c >= C) return;
+        dst[b * C * S + c * S + s] = src[b * S * C + s * C + c];
+    }
+
+    // Scaled add: out = a + scale * b
+    kernel void add_scaled(
+        device const half* a [[buffer(0)]],
+        device const half* b [[buffer(1)]],
+        device half* out [[buffer(2)]],
+        constant float& scale [[buffer(3)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        out[tid] = half(float(a[tid]) + scale * float(b[tid]));
+    }
+
+    // Two-scale add: out = scaleA * a + scaleB * b
+    kernel void add_scaled2(
+        device const half* a [[buffer(0)]],
+        device const half* b [[buffer(1)]],
+        device half* out [[buffer(2)]],
+        constant float& scaleA [[buffer(3)]],
+        constant float& scaleB [[buffer(4)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        out[tid] = half(scaleA * float(a[tid]) + scaleB * float(b[tid]));
+    }
+
+    // Scaled add f32: out = a + scale * b
+    kernel void add_scaled_f32(
+        device const float* a [[buffer(0)]],
+        device const float* b [[buffer(1)]],
+        device float* out [[buffer(2)]],
+        constant float& scale [[buffer(3)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        out[tid] = a[tid] + scale * b[tid];
+    }
+
+    // Two-scale add f32: out = scaleA * a + scaleB * b
+    kernel void add_scaled2_f32(
+        device const float* a [[buffer(0)]],
+        device const float* b [[buffer(1)]],
+        device float* out [[buffer(2)]],
+        constant float& scaleA [[buffer(3)]],
+        constant float& scaleB [[buffer(4)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        out[tid] = scaleA * a[tid] + scaleB * b[tid];
+    }
+
+    // AdaLN param extract: out[b*dim+c] = table[param_idx*dim+c] + tsEmb[b*numParams*dim + param_idx*dim + c]
+    kernel void ada_ln_param(
+        device const half* table [[buffer(0)]],
+        device const half* tsEmb [[buffer(1)]],
+        device half* out [[buffer(2)]],
+        constant uint& param_idx [[buffer(3)]],
+        constant uint& dim [[buffer(4)]],
+        constant uint& num_params [[buffer(5)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        uint b = tid / dim;
+        uint c = tid % dim;
+        out[tid] = half(float(table[param_idx * dim + c]) + float(tsEmb[b * num_params * dim + param_idx * dim + c]));
+    }
+
+    // Broadcast [B, dim] → [B, numTokens, dim]: out[b*N*D + t*D + d] = src[b*D + d]
+    kernel void broadcast_seq(
+        device const half* src [[buffer(0)]],
+        device half* out [[buffer(1)]],
+        constant uint& N [[buffer(2)]],  // numTokens
+        constant uint& D [[buffer(3)]],  // dim
+        uint tid [[thread_position_in_grid]])
+    {
+        uint ND = N * D;
+        uint b = tid / ND;
+        uint d = tid % D;
+        out[tid] = src[b * D + d];
+    }
+
+    // 1 + x element-wise
+    kernel void one_plus(
+        device const half* x [[buffer(0)]],
+        device half* out [[buffer(1)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        out[tid] = half(1.0f + float(x[tid]));
+    }
+
+    // 1 + x element-wise (f32)
+    kernel void one_plus_f32(
+        device const float* x [[buffer(0)]],
+        device float* out [[buffer(1)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        out[tid] = 1.0f + x[tid];
+    }
+
+    // SiLU f32: out = x / (1 + exp(-x))
+    kernel void silu_f32(
+        device const float* x [[buffer(0)]],
+        device float* out [[buffer(1)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        float v = x[tid];
+        out[tid] = v / (1.0f + exp(-v));
+    }
+
+    // Element-wise multiply f32
+    kernel void mul_f32(
+        device const float* a [[buffer(0)]],
+        device const float* b [[buffer(1)]],
+        device float* out [[buffer(2)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        out[tid] = a[tid] * b[tid];
+    }
+
+    // Broadcast [B, dim] → [B, numTokens, dim] f32
+    kernel void broadcast_seq_f32(
+        device const float* src [[buffer(0)]],
+        device float* out [[buffer(1)]],
+        constant uint& N [[buffer(2)]],
+        constant uint& D [[buffer(3)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        uint ND = N * D;
+        uint b = tid / ND;
+        uint d = tid % D;
+        out[tid] = src[b * D + d];
+    }
+
+    // AdaLN modulate f32: out = x * (1 + scale) + shift
+    kernel void adaln_modulate_f32(
+        device const float* x [[buffer(0)]],
+        device const float* scale [[buffer(1)]],
+        device const float* shift [[buffer(2)]],
+        device float* out [[buffer(3)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        out[tid] = x[tid] * (1.0f + scale[tid]) + shift[tid];
+    }
+
+    // 3D RoPE f32
+    kernel void rope_3d_f32(
+        device const float* src [[buffer(0)]],
+        device float* dst [[buffer(1)]],
+        device const float* cos_freqs [[buffer(2)]],
+        device const float* sin_freqs [[buffer(3)]],
+        constant uint& dim [[buffer(4)]],
+        uint2 tid [[thread_position_in_grid]])
+    {
+        uint pair = tid.x;
+        uint bs = tid.y;
+        uint base = bs * dim;
+        uint i0 = pair * 2;
+        uint i1 = pair * 2 + 1;
+        float x0 = src[base + i0];
+        float x1 = src[base + i1];
+        float c = cos_freqs[base + i0];
+        float s = sin_freqs[base + i0];
+        dst[base + i0] = x0 * c - x1 * s;
+        dst[base + i1] = x1 * c + x0 * s;
+    }
+
+    // Transpose [seqLen, nHeads, headDim] → [nHeads, seqLen, headDim] f32
+    kernel void transpose_sh_f32(
+        device const float* src [[buffer(0)]],
+        device float* dst [[buffer(1)]],
+        constant uint& seqLen [[buffer(2)]],
+        constant uint& nHeads [[buffer(3)]],
+        constant uint& headDim [[buffer(4)]],
+        uint2 tid [[thread_position_in_grid]])
+    {
+        uint d = tid.x;
+        uint idx = tid.y;
+        uint s = idx / nHeads;
+        uint h = idx % nHeads;
+        dst[h * seqLen * headDim + s * headDim + d] = src[s * nHeads * headDim + h * headDim + d];
+    }
+
+    // Transpose [nHeads, seqLen, headDim] → [seqLen, nHeads, headDim] f32
+    kernel void transpose_hs_f32(
+        device const float* src [[buffer(0)]],
+        device float* dst [[buffer(1)]],
+        constant uint& seqLen [[buffer(2)]],
+        constant uint& nHeads [[buffer(3)]],
+        constant uint& headDim [[buffer(4)]],
+        uint2 tid [[thread_position_in_grid]])
+    {
+        uint d = tid.x;
+        uint idx = tid.y;
+        uint h = idx / seqLen;
+        uint s = idx % seqLen;
+        dst[s * nHeads * headDim + h * headDim + d] = src[h * seqLen * headDim + s * headDim + d];
+    }
+
+    // RMS Norm f32 input → f32 output
+    kernel void rms_norm_f32(
+        device const float* x [[buffer(0)]],
+        device const float* weight [[buffer(1)]],
+        device float* out [[buffer(2)]],
+        constant uint& dim [[buffer(3)]],
+        constant float& eps [[buffer(4)]],
+        uint tg_id [[threadgroup_position_in_grid]],
+        uint tid_in_tg [[thread_index_in_threadgroup]],
+        uint tg_size [[threads_per_threadgroup]])
+    {
+        uint row = tg_id;
+        uint off = row * dim;
+        float sum_sq = 0;
+        for (uint i = tid_in_tg; i < dim; i += tg_size) {
+            float v = x[off + i];
+            sum_sq += v * v;
+        }
+        sum_sq += simd_shuffle_xor(sum_sq, 1);
+        sum_sq += simd_shuffle_xor(sum_sq, 2);
+        sum_sq += simd_shuffle_xor(sum_sq, 4);
+        sum_sq += simd_shuffle_xor(sum_sq, 8);
+        sum_sq += simd_shuffle_xor(sum_sq, 16);
+        threadgroup float shared[8];
+        uint simd_lane = tid_in_tg % 32;
+        uint simd_id = tid_in_tg / 32;
+        if (simd_lane == 0) shared[simd_id] = sum_sq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid_in_tg == 0) {
+            float total_sq = 0;
+            uint num_simds = (tg_size + 31) / 32;
+            for (uint i = 0; i < num_simds; i++) total_sq += shared[i];
+            shared[0] = rsqrt(total_sq / float(dim) + eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float rms = shared[0];
+        for (uint i = tid_in_tg; i < dim; i += tg_size) {
+            out[off + i] = x[off + i] * rms * weight[i];
+        }
+    }
+
+    // Layer norm f32 input → f32 output
+    kernel void layer_norm_f32(
+        device const float* x [[buffer(0)]],
+        device const float* ln_weight [[buffer(1)]],
+        device const float* ln_bias [[buffer(2)]],
+        device float* out [[buffer(3)]],
+        constant uint& dim [[buffer(4)]],
+        constant float& eps [[buffer(5)]],
+        uint tg_id [[threadgroup_position_in_grid]],
+        uint tid_in_tg [[thread_index_in_threadgroup]],
+        uint tg_size [[threads_per_threadgroup]])
+    {
+        uint row = tg_id;
+        uint off = row * dim;
+        float local_sum = 0, local_sum_sq = 0;
+        for (uint i = tid_in_tg; i < dim; i += tg_size) {
+            float v = x[off + i];
+            local_sum += v;
+            local_sum_sq += v * v;
+        }
+        local_sum += simd_shuffle_xor(local_sum, 1);
+        local_sum += simd_shuffle_xor(local_sum, 2);
+        local_sum += simd_shuffle_xor(local_sum, 4);
+        local_sum += simd_shuffle_xor(local_sum, 8);
+        local_sum += simd_shuffle_xor(local_sum, 16);
+        local_sum_sq += simd_shuffle_xor(local_sum_sq, 1);
+        local_sum_sq += simd_shuffle_xor(local_sum_sq, 2);
+        local_sum_sq += simd_shuffle_xor(local_sum_sq, 4);
+        local_sum_sq += simd_shuffle_xor(local_sum_sq, 8);
+        local_sum_sq += simd_shuffle_xor(local_sum_sq, 16);
+        threadgroup float shared[16];
+        uint simd_lane = tid_in_tg % 32;
+        uint simd_id = tid_in_tg / 32;
+        if (simd_lane == 0) {
+            shared[simd_id * 2] = local_sum;
+            shared[simd_id * 2 + 1] = local_sum_sq;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid_in_tg == 0) {
+            float total_sum = 0, total_sum_sq = 0;
+            uint num_simds = (tg_size + 31) / 32;
+            for (uint i = 0; i < num_simds; i++) {
+                total_sum += shared[i * 2];
+                total_sum_sq += shared[i * 2 + 1];
+            }
+            float mean = total_sum / float(dim);
+            float variance = total_sum_sq / float(dim) - mean * mean;
+            shared[0] = mean;
+            shared[1] = rsqrt(variance + eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float mean = shared[0];
+        float inv_std = shared[1];
+        for (uint i = tid_in_tg; i < dim; i += tg_size) {
+            float v = (x[off + i] - mean) * inv_std;
+            out[off + i] = v * ln_weight[i] + ln_bias[i];
+        }
+    }
+
+    // AdaLN param f32: table f16 + tsEmb f32 → f32 output
+    kernel void ada_ln_param_f32(
+        device const half* table [[buffer(0)]],
+        device const float* tsEmb [[buffer(1)]],
+        device float* out [[buffer(2)]],
+        constant uint& param_idx [[buffer(3)]],
+        constant uint& dim [[buffer(4)]],
+        constant uint& num_params [[buffer(5)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        uint b = tid / dim;
+        uint c = tid % dim;
+        out[tid] = float(table[param_idx * dim + c]) + tsEmb[b * num_params * dim + param_idx * dim + c];
+    }
+
+    // Timestep embedding f32 output
+    kernel void timestep_embedding_f32(
+        device const float* timesteps [[buffer(0)]],
+        device float* output [[buffer(1)]],
+        constant uint& dim [[buffer(2)]],
+        uint2 tid [[thread_position_in_grid]])
+    {
+        uint i = tid.x;
+        uint b = tid.y;
+        if (i >= dim) return;
+        uint half_dim = dim / 2;
+        float t = timesteps[b];
+        if (i < half_dim) {
+            float freq = exp(-log(10000.0f) * float(i) / float(half_dim));
+            output[b * dim + i] = cos(t * freq);
+        } else {
+            float freq = exp(-log(10000.0f) * float(i - half_dim) / float(half_dim));
+            output[b * dim + i] = sin(t * freq);
+        }
+    }
+
+    // AdaLN combine2 f32: table f16 + tsEmb f32 → f32
+    // NOTE: same OOB fix as ada_ln_combine2 — tsEmb is [B,C], not [B,2C]
+    kernel void ada_ln_combine2_f32(
+        device const half* table [[buffer(0)]],
+        device const float* tsEmb [[buffer(1)]],
+        device float* out0 [[buffer(2)]],
+        device float* out1 [[buffer(3)]],
+        constant uint& C [[buffer(4)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        uint b = tid / C;
+        uint c = tid % C;
+        uint base = b * C;
+        out0[tid] = float(table[c]) + tsEmb[base + c];
+        out1[tid] = float(table[C + c]) + tsEmb[base + c];
+    }
+
+    // AdaLN combine2 shared: table[2,C] + tsEmb[B,C] (SHARED across both outputs) → 2 × [B,C] f32
+    // out0[b*C+c] = table[c] + tsEmb[b*C+c]
+    // out1[b*C+c] = table[C+c] + tsEmb[b*C+c]
+    kernel void ada_ln_combine2_shared_f32(
+        device const half* table [[buffer(0)]],
+        device const float* tsEmb [[buffer(1)]],
+        device float* out0 [[buffer(2)]],
+        device float* out1 [[buffer(3)]],
+        constant uint& C [[buffer(4)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        uint b = tid / C;
+        uint c = tid % C;
+        float ts = tsEmb[b * C + c];
+        out0[tid] = float(table[c]) + ts;
+        out1[tid] = float(table[C + c]) + ts;
+    }
+
+    // Broadcast bias f32 from f32 bias: out[row*N + col] += bias_f32[col]
+    kernel void broadcast_bias_add_f32_f32(
+        device float* out [[buffer(0)]],
+        device const float* bias_data [[buffer(1)]],
+        constant uint& N [[buffer(2)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        uint col = tid % N;
+        out[tid] += bias_data[col];
+    }
+
+    // ========== F32 Pipeline Kernels (Phase 3) ==========
+
+    // Per-channel scale+bias f32: out[i] = x[i] * scale[c] + bias[c]
+    // Layout: [B, C, spatial], tid = b*C*spatial + c*spatial + s
+    kernel void channel_scale_bias_f32(
+        device const float* x [[buffer(0)]],
+        device const float* scale [[buffer(1)]],
+        device const float* bias [[buffer(2)]],
+        device float* out [[buffer(3)]],
+        constant uint& C [[buffer(4)]],
+        constant uint& spatial [[buffer(5)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        uint c = (tid / spatial) % C;
+        out[tid] = x[tid] * scale[c] + bias[c];
+    }
+
+    // 1x1x1 convolution f32 — input-stationary with shared memory.
+    // Grid: dispatchThreadgroups(D*H*W, B, 1), threadsPerThreadgroup(min(C_out, 256), 1, 1)
+    kernel void conv3d_1x1x1_f32(
+        device const float* input [[buffer(0)]],
+        device const float* weight [[buffer(1)]],
+        device const float* bias [[buffer(2)]],
+        device float* output [[buffer(3)]],
+        constant uint* params [[buffer(4)]],
+        uint2 tgid [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint2 tg_size2 [[threads_per_threadgroup]],
+        threadgroup float* smem [[threadgroup(0)]])
+    {
+        uint C_in = params[0];
+        uint spatial_size = params[1];
+        uint C_out = params[2];
+        uint TILE_C = params[3];
+
+        uint tg_size = tg_size2.x;
+        uint s = tgid.x;
+        uint b = tgid.y;
+
+        uint in_base = b * C_in * spatial_size + s;
+        uint ocs_per_thread = (C_out + tg_size - 1) / tg_size;
+
+        float acc[4] = {0, 0, 0, 0};
+
+        for (uint c_start = 0; c_start < C_in; c_start += TILE_C) {
+            uint c_end = min(c_start + TILE_C, C_in);
+            uint tile_c = c_end - c_start;
+
+            for (uint i = tid; i < tile_c; i += tg_size) {
+                smem[i] = input[in_base + (c_start + i) * spatial_size];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint o = 0; o < ocs_per_thread; o++) {
+                uint oc = tid + o * tg_size;
+                if (oc >= C_out) break;
+                float s2 = 0;
+                uint w_base = oc * C_in + c_start;
+                for (uint i = 0; i < tile_c; i++) {
+                    s2 += smem[i] * weight[w_base + i];
+                }
+                acc[o] += s2;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        uint out_base = b * C_out * spatial_size + s;
+        for (uint o = 0; o < ocs_per_thread; o++) {
+            uint oc = tid + o * tg_size;
+            if (oc >= C_out) break;
+            output[out_base + oc * spatial_size] = acc[o] + bias[oc];
+        }
+    }
+
+    // Gather input for one kernel position (f32).
+    // Grid: (C_in, M)
+    kernel void gather_input_3d_f32(
+        device const float* input [[buffer(0)]],
+        device float* output [[buffer(1)]],
+        constant uint* params [[buffer(2)]],
+        uint2 tid [[thread_position_in_grid]])
+    {
+        uint C_in = params[0];
+        uint D_in = params[1], H_in = params[2], W_in = params[3];
+        uint D_out = params[4], H_out = params[5], W_out = params[6];
+        uint fd = params[7], fh = params[8], fw = params[9];
+        uint sD = params[10], sH = params[11], sW = params[12];
+        uint pD = params[13], pH = params[14], pW = params[15];
+        uint rowOff = params[16];
+
+        uint ic = tid.x;
+        uint m_local = tid.y;
+        if (ic >= C_in) return;
+
+        uint m = rowOff + m_local;
+        uint spatial_out = D_out * H_out * W_out;
+        uint b = m / spatial_out;
+        uint rem = m % spatial_out;
+        uint od = rem / (H_out * W_out);
+        uint rem2 = rem % (H_out * W_out);
+        uint oh = rem2 / W_out;
+        uint ow = rem2 % W_out;
+
+        int id = int(od * sD + fd) - int(pD);
+        int ih = int(oh * sH + fh) - int(pH);
+        int iw = int(ow * sW + fw) - int(pW);
+
+        float val = 0.0f;
+        if (id >= 0 && uint(id) < D_in && ih >= 0 && uint(ih) < H_in && iw >= 0 && uint(iw) < W_in) {
+            uint HW_in = H_in * W_in;
+            val = input[b * C_in * D_in * HW_in + ic * D_in * HW_in + uint(id) * HW_in + uint(ih) * W_in + uint(iw)];
+        }
+        output[m_local * C_in + ic] = val;
+    }
+
+    // Extract weight slice f32.
+    // Grid: (C_in, C_out)
+    // im2col 3D f32: gather ALL kernel positions into one matrix.
+    // Input: [B, C_in, D_in, H_in, W_in] NCDHW f32
+    // Output: [M, C_in * kSize] row-major f32, where M = B * D_out * H_out * W_out
+    // Each thread handles one (m, col) element where col = ic * kSize + kPos
+    // params: [C_in, D_in, H_in, W_in, D_out, H_out, W_out, kD, kH, kW, sD, sH, sW, pD, pH, pW]
+    // Grid: (C_in * kSize, M)
+    kernel void im2col_3d_f32(
+        device const float* input [[buffer(0)]],
+        device float* output [[buffer(1)]],
+        constant uint* params [[buffer(2)]],
+        uint2 tid [[thread_position_in_grid]])
+    {
+        uint C_in = params[0];
+        uint D_in = params[1], H_in = params[2], W_in = params[3];
+        uint D_out = params[4], H_out = params[5], W_out = params[6];
+        uint kD = params[7], kH = params[8], kW = params[9];
+        uint sD = params[10], sH = params[11], sW = params[12];
+        uint pD = params[13], pH = params[14], pW = params[15];
+
+        uint kSize = kD * kH * kW;
+        uint col = tid.x;  // 0..C_in*kSize-1
+        uint m = tid.y;    // 0..M-1
+        if (col >= C_in * kSize) return;
+
+        uint ic = col / kSize;
+        uint kPos = col % kSize;
+        uint fd = kPos / (kH * kW);
+        uint fh = (kPos / kW) % kH;
+        uint fw = kPos % kW;
+
+        uint spatial_out = D_out * H_out * W_out;
+        uint b = m / spatial_out;
+        uint rem = m % spatial_out;
+        uint od = rem / (H_out * W_out);
+        uint rem2 = rem % (H_out * W_out);
+        uint oh = rem2 / W_out;
+        uint ow = rem2 % W_out;
+
+        int id = int(od * sD + fd) - int(pD);
+        int ih = int(oh * sH + fh) - int(pH);
+        int iw = int(ow * sW + fw) - int(pW);
+
+        float val = 0.0f;
+        if (id >= 0 && uint(id) < D_in && ih >= 0 && uint(ih) < H_in && iw >= 0 && uint(iw) < W_in) {
+            uint HW_in = H_in * W_in;
+            val = input[b * C_in * D_in * HW_in + ic * D_in * HW_in + uint(id) * HW_in + uint(ih) * W_in + uint(iw)];
+        }
+        output[m * C_in * kSize + col] = val;
+    }
+
+    // Scatter GEMM result [M, C_out] row-major → [B, C_out, spatial] NCHW + bias.
+    // Single pass (no accumulation needed since im2col+GEMM does it all at once).
+    // params: [C_out, spatial]
+    // Grid: M * C_out
+    kernel void scatter_conv_output_f32(
+        device const float* gemm_out [[buffer(0)]],
+        device const float* bias_data [[buffer(1)]],
+        device float* output [[buffer(2)]],
+        constant uint* params [[buffer(3)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        uint C_out = params[0];
+        uint spatial = params[1];
+
+        uint m = tid / C_out;
+        uint c = tid % C_out;
+        uint b = m / spatial;
+        uint s = m % spatial;
+
+        uint out_idx = b * C_out * spatial + c * spatial + s;
+        output[out_idx] = gemm_out[m * C_out + c] + bias_data[c];
+    }
+
+    kernel void extract_weight_slice_f32(
+        device const float* weight [[buffer(0)]],
+        device float* output [[buffer(1)]],
+        constant uint* params [[buffer(2)]],
+        uint2 tid [[thread_position_in_grid]])
+    {
+        uint C_in = params[0];
+        uint kSize = params[1];
+        uint kPos = params[2];
+        uint ic = tid.x;
+        uint oc = tid.y;
+        if (ic >= C_in) return;
+        output[oc * C_in + ic] = weight[oc * C_in * kSize + ic * kSize + kPos];
+    }
+
+    // Accumulate GEMM output into NCHW conv output (f32).
+    // Grid: M * C_out
+    kernel void accumulate_conv_output_f32(
+        device const float* gemm_out [[buffer(0)]],
+        device const float* bias_data [[buffer(1)]],
+        device float* output [[buffer(2)]],
+        constant uint* params [[buffer(3)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        uint C_out = params[0];
+        uint spatial = params[1];
+        uint is_first = params[2];
+        uint rowOff = params[3];
+
+        uint m_local = tid / C_out;
+        uint c = tid % C_out;
+        uint m = rowOff + m_local;
+        uint b = m / spatial;
+        uint s = m % spatial;
+
+        uint out_idx = b * C_out * spatial + c * spatial + s;
+        float g = gemm_out[m_local * C_out + c];
+
+        if (is_first) {
+            output[out_idx] = g + bias_data[c];
+        } else {
+            output[out_idx] = output[out_idx] + g;
+        }
+    }
+
+    // Group norm 3D f32: input/output float, weight/bias float.
+    // Grid: (numGroups, B) threadgroups, 256 threads each
+    kernel void group_norm_3d_f32(
+        device const float* input [[buffer(0)]],
+        device const float* weight [[buffer(1)]],
+        device const float* gn_bias [[buffer(2)]],
+        device float* output [[buffer(3)]],
+        constant uint& C [[buffer(4)]],
+        constant uint& spatial_size [[buffer(5)]],
+        constant uint& num_groups [[buffer(6)]],
+        constant float& eps [[buffer(7)]],
+        uint2 tg_id [[threadgroup_position_in_grid]],
+        uint tid_in_tg [[thread_index_in_threadgroup]],
+        uint2 tg_size2 [[threads_per_threadgroup]])
+    {
+        uint tg_size = tg_size2.x;
+        uint g = tg_id.x;
+        uint b = tg_id.y;
+        uint channels_per_group = C / num_groups;
+        uint group_size = channels_per_group * spatial_size;
+        uint base = b * C * spatial_size + g * channels_per_group * spatial_size;
+
+        float local_sum = 0;
+        float local_sum_sq = 0;
+        for (uint i = tid_in_tg; i < group_size; i += tg_size) {
+            float v = input[base + i];
+            local_sum += v;
+            local_sum_sq += v * v;
+        }
+
+        local_sum += simd_shuffle_xor(local_sum, 1);
+        local_sum += simd_shuffle_xor(local_sum, 2);
+        local_sum += simd_shuffle_xor(local_sum, 4);
+        local_sum += simd_shuffle_xor(local_sum, 8);
+        local_sum += simd_shuffle_xor(local_sum, 16);
+        local_sum_sq += simd_shuffle_xor(local_sum_sq, 1);
+        local_sum_sq += simd_shuffle_xor(local_sum_sq, 2);
+        local_sum_sq += simd_shuffle_xor(local_sum_sq, 4);
+        local_sum_sq += simd_shuffle_xor(local_sum_sq, 8);
+        local_sum_sq += simd_shuffle_xor(local_sum_sq, 16);
+
+        threadgroup float shared[16];
+        uint simd_lane = tid_in_tg % 32;
+        uint simd_id = tid_in_tg / 32;
+        if (simd_lane == 0) {
+            shared[simd_id * 2] = local_sum;
+            shared[simd_id * 2 + 1] = local_sum_sq;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid_in_tg == 0) {
+            float total_sum = 0, total_sum_sq = 0;
+            uint num_simds = (tg_size + 31) / 32;
+            for (uint i = 0; i < num_simds; i++) {
+                total_sum += shared[i * 2];
+                total_sum_sq += shared[i * 2 + 1];
+            }
+            float mean = total_sum / float(group_size);
+            float variance = total_sum_sq / float(group_size) - mean * mean;
+            shared[0] = mean;
+            shared[1] = rsqrt(variance + eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float mean = shared[0];
+        float inv_std = shared[1];
+
+        for (uint i = tid_in_tg; i < group_size; i += tg_size) {
+            uint c_local = i / spatial_size;
+            uint c_global = g * channels_per_group + c_local;
+            float v = (input[base + i] - mean) * inv_std;
+            output[base + i] = v * weight[c_global] + gn_bias[c_global];
+        }
+    }
+
+    // 3D Pixel shuffle f32: [B, C*p1*p2*p3, D, H, W] -> [B, C, D*p1, H*p2, W*p3]
+    kernel void pixel_shuffle_3d_f32(
+        device const float* input [[buffer(0)]],
+        device float* output [[buffer(1)]],
+        constant uint* params [[buffer(2)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        uint C_out = params[0];
+        uint D_out = params[1], H_out = params[2], W_out = params[3];
+        uint p1 = params[4], p2 = params[5], p3 = params[6];
+        uint B = params[7];
+        uint D_in = D_out / p1, H_in = H_out / p2, W_in = W_out / p3;
+        uint C_in = C_out * p1 * p2 * p3;
+        uint out_spatial = D_out * H_out * W_out;
+        uint total = B * C_out * out_spatial;
+        if (tid >= total) return;
+
+        uint rem = tid;
+        uint b = rem / (C_out * out_spatial); rem %= (C_out * out_spatial);
+        uint c = rem / out_spatial; rem %= out_spatial;
+        uint od = rem / (H_out * W_out); rem %= (H_out * W_out);
+        uint oh = rem / W_out;
+        uint ow = rem % W_out;
+
+        uint id = od / p1, r1 = od % p1;
+        uint ih = oh / p2, r2 = oh % p2;
+        uint iw = ow / p3, r3 = ow % p3;
+
+        uint ic = c * p1 * p2 * p3 + r1 * p2 * p3 + r2 * p3 + r3;
+        uint in_idx = b * C_in * D_in * H_in * W_in + ic * D_in * H_in * W_in + id * H_in * W_in + ih * W_in + iw;
+        output[tid] = input[in_idx];
+    }
+
+    // Element-wise add f32 (out-of-place): out = a + b
+    kernel void elem_add_f32_oop(
+        device const float* a [[buffer(0)]],
+        device const float* b [[buffer(1)]],
+        device float* out [[buffer(2)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        out[tid] = a[tid] + b[tid];
     }
 
     // Naive GPU attention with causal mask — parallelized across D dimension.

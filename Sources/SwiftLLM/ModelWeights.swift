@@ -177,6 +177,6 @@ private func float16ToFloat32(_ h: UInt16) -> Float {
     return Float(bitPattern: bits)
 }
 
-private func bfloat16ToFloat32(_ b: UInt16) -> Float {
+func bfloat16ToFloat32(_ b: UInt16) -> Float {
     Float(bitPattern: UInt32(b) << 16)
 }

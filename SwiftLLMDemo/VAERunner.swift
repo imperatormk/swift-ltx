@@ -11,7 +11,7 @@ final class VAERunner: ObservableObject {
 
     #if os(macOS)
     @Published var modelPath = NSString(string: "~/Downloads/ltxv_vae_decoder_f16.safetensors").expandingTildeInPath
-    @Published var latentPath = NSString(string: "~/Downloads/ltxv_pipeline_latents.safetensors").expandingTildeInPath
+    @Published var latentPath = "/tmp/mlx_vae_input_latents.safetensors"
     #else
     @Published var modelPath = {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
@@ -228,17 +228,28 @@ enum VAEError: Error, CustomStringConvertible {
 }
 
 /// Extract the first frame (F=0) from a [B, 3, F, H, W] f16 tensor → RGBA8 Data.
-private func extractFirstFrame(from tensor: Tensor) -> DecodedFrame {
+func extractFirstFrame(from tensor: Tensor) -> DecodedFrame {
     let shape = tensor.shape
+    print("[extractFirstFrame] shape=\(shape) count=\(tensor.count) bufferLen=\(tensor.buffer.length)")
     // [B, C, F, H, W]
+    guard shape.count >= 5 else {
+        print("[extractFirstFrame] ERROR: expected 5D, got \(shape)")
+        return DecodedFrame(width: 1, height: 1, rgbaData: Data([255, 0, 0, 255]))
+    }
     let C = shape[1]
+    let F = shape[2]
     let H = shape[3]
     let W = shape[4]
-    let F = shape[2]
+
+    let totalElements = shape.reduce(1, *)
+    let bufferElements = tensor.buffer.length / 2  // f16
+    guard bufferElements >= totalElements else {
+        print("[extractFirstFrame] ERROR: buffer too small: \(bufferElements) < \(totalElements)")
+        return DecodedFrame(width: 1, height: 1, rgbaData: Data([255, 0, 0, 255]))
+    }
 
     let ptr = tensor.buffer.contents().assumingMemoryBound(to: UInt16.self)
     // Layout: B * C * F * H * W, take B=0, F=0
-    let frameStride = H * W
     let chanStride = F * H * W
 
     var rgba = Data(count: H * W * 4)
@@ -248,14 +259,14 @@ private func extractFirstFrame(from tensor: Tensor) -> DecodedFrame {
             for x in 0..<W {
                 let spatialIdx = y * W + x
                 for c in 0..<min(C, 3) {
-                    let srcIdx = c * chanStride + 0 * frameStride + spatialIdx
+                    let srcIdx = c * chanStride + spatialIdx
                     let f16bits = ptr[srcIdx]
                     let val = f16ToFloat(f16bits)
-                    // VAE output is in [-1, 1] range, map to [0, 1]
-                    let clamped = min(max(val / 2.0 + 0.5, 0), 1)
+                    let mapped = val / 2.0 + 0.5
+                    let clamped = mapped.isNaN ? Float(0) : min(max(mapped, 0), 1)
                     dst[spatialIdx * 4 + c] = UInt8(clamped * 255)
                 }
-                dst[spatialIdx * 4 + 3] = 255  // alpha
+                dst[spatialIdx * 4 + 3] = 255
             }
         }
     }

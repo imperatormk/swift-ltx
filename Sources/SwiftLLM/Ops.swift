@@ -381,6 +381,100 @@ public func matmulF16(
     return out
 }
 
+/// f16×f16 → f32 GEMM via FlashAttention. A: [M,K] f16, B^T: [N,K] f16, C: [M,N] f32.
+public func matmulF16toF32(
+    _ a: Tensor, _ b: Tensor,
+    M: Int, K: Int, N: Int
+) -> MTLBuffer {
+    var gemmDesc = GEMMDescriptor()
+    gemmDesc.matrixDimensions = (M: UInt32(M), N: UInt32(N), K: UInt32(K))
+    gemmDesc.memoryPrecisions = (A: .FP16, B: .FP16, C: .FP32)
+    gemmDesc.transposeState = (A: false, B: true)
+    gemmDesc.quantizedB = false
+
+    let (kernel, pipeline) = GEMMKernel.pipeline(for: gemmDesc)
+    let bufLen = M * N * 4
+    let out = MetalContext.shared.device.makeBuffer(length: bufLen, options: .storageModeShared)!
+
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipeline)
+        enc.setThreadgroupMemoryLength(Int(kernel.threadgroupMemoryAllocation), index: 0)
+        enc.setBuffer(a.buffer, offset: 0, index: 0)
+        enc.setBuffer(b.buffer, offset: 0, index: 1)
+        enc.setBuffer(out, offset: 0, index: 2)
+        let gridSize = MTLSize(
+            width: (N + Int(kernel.blockDimensions.N) - 1) / Int(kernel.blockDimensions.N),
+            height: (M + Int(kernel.blockDimensions.M) - 1) / Int(kernel.blockDimensions.M),
+            depth: 1)
+        enc.dispatchThreadgroups(
+            gridSize,
+            threadsPerThreadgroup: MTLSize(width: Int(kernel.threadgroupSize), height: 1, depth: 1))
+    }
+    return out
+}
+
+/// f32×f32 → f32 GEMM via FlashAttention. A: [M,K] f32, B^T: [N,K] f32, C: [M,N] f32.
+public func matmulF32xF32(
+    _ a: MTLBuffer, _ b: MTLBuffer,
+    M: Int, K: Int, N: Int
+) -> MTLBuffer {
+    var gemmDesc = GEMMDescriptor()
+    gemmDesc.matrixDimensions = (M: UInt32(M), N: UInt32(N), K: UInt32(K))
+    gemmDesc.memoryPrecisions = (A: .FP32, B: .FP32, C: .FP32)
+    gemmDesc.transposeState = (A: false, B: true)
+    gemmDesc.quantizedB = false
+
+    let (kernel, pipeline) = GEMMKernel.pipeline(for: gemmDesc)
+    let out = MetalContext.shared.device.makeBuffer(length: M * N * 4, options: .storageModeShared)!
+
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipeline)
+        enc.setThreadgroupMemoryLength(Int(kernel.threadgroupMemoryAllocation), index: 0)
+        enc.setBuffer(a, offset: 0, index: 0)
+        enc.setBuffer(b, offset: 0, index: 1)
+        enc.setBuffer(out, offset: 0, index: 2)
+        let gridSize = MTLSize(
+            width: (N + Int(kernel.blockDimensions.N) - 1) / Int(kernel.blockDimensions.N),
+            height: (M + Int(kernel.blockDimensions.M) - 1) / Int(kernel.blockDimensions.M),
+            depth: 1)
+        enc.dispatchThreadgroups(
+            gridSize,
+            threadsPerThreadgroup: MTLSize(width: Int(kernel.threadgroupSize), height: 1, depth: 1))
+    }
+    return out
+}
+
+/// f32×f16 → f32 GEMM via FlashAttention. A: [M,K] f32, B^T: [N,K] f16, C: [M,N] f32.
+public func matmulF32xF16(
+    _ a: MTLBuffer, _ b: Tensor,
+    M: Int, K: Int, N: Int
+) -> MTLBuffer {
+    var gemmDesc = GEMMDescriptor()
+    gemmDesc.matrixDimensions = (M: UInt32(M), N: UInt32(N), K: UInt32(K))
+    gemmDesc.memoryPrecisions = (A: .FP32, B: .FP16, C: .FP32)
+    gemmDesc.transposeState = (A: false, B: true)
+    gemmDesc.quantizedB = false
+
+    let (kernel, pipeline) = GEMMKernel.pipeline(for: gemmDesc)
+    let out = MetalContext.shared.device.makeBuffer(length: M * N * 4, options: .storageModeShared)!
+
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipeline)
+        enc.setThreadgroupMemoryLength(Int(kernel.threadgroupMemoryAllocation), index: 0)
+        enc.setBuffer(a, offset: 0, index: 0)
+        enc.setBuffer(b.buffer, offset: 0, index: 1)
+        enc.setBuffer(out, offset: 0, index: 2)
+        let gridSize = MTLSize(
+            width: (N + Int(kernel.blockDimensions.N) - 1) / Int(kernel.blockDimensions.N),
+            height: (M + Int(kernel.blockDimensions.M) - 1) / Int(kernel.blockDimensions.M),
+            depth: 1)
+        enc.dispatchThreadgroups(
+            gridSize,
+            threadsPerThreadgroup: MTLSize(width: Int(kernel.threadgroupSize), height: 1, depth: 1))
+    }
+    return out
+}
+
 /// Simple tiled GEMM — no per-shape compilation. C[M,N] = A[M,K] × B^T[N,K].
 /// Slower than FlashAttention GEMM but compiles once for all shapes.
 public func simpleMatmulF16(
@@ -405,6 +499,165 @@ public func simpleMatmulF16(
         let gridH = (M + 31) / 32
         enc.dispatchThreadgroups(MTLSize(width: gridW, height: gridH, depth: 1),
                                 threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1))
+    }
+    return out
+}
+
+/// GEMM with f32 output: C[M,N] = A[M,K] × B^T[N,K]. A/B are f16, C is f32.
+public func simpleMatmulF16toF32(
+    _ a: Tensor, _ b: Tensor,
+    M: Int, K: Int, N: Int
+) -> MTLBuffer {
+    let ctx = MetalContext.shared
+    let out = ctx.device.makeBuffer(length: M * N * 4, options: .storageModeShared)!
+    let pipe = KernelCache.shared.pipeline("simple_gemm_f16_f32out")
+    var m = UInt32(M), n = UInt32(N), k = UInt32(K)
+    ctx.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(a.buffer, offset: 0, index: 0)
+        enc.setBuffer(b.buffer, offset: 0, index: 1)
+        enc.setBuffer(out, offset: 0, index: 2)
+        enc.setBytes(&m, length: 4, index: 3)
+        enc.setBytes(&n, length: 4, index: 4)
+        enc.setBytes(&k, length: 4, index: 5)
+        enc.setThreadgroupMemoryLength(4096, index: 0)
+        let gridW = (N + 31) / 32
+        let gridH = (M + 31) / 32
+        enc.dispatchThreadgroups(MTLSize(width: gridW, height: gridH, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1))
+    }
+    return out
+}
+
+/// Add f16 bias to f32 buffer in-place: buf[row*N + col] += bias[col]
+public func addBiasF32(_ buf: MTLBuffer, bias: Tensor, M: Int, N: Int) {
+    let pipe = KernelCache.shared.pipeline("broadcast_bias_add_f32")
+    var n = UInt32(N)
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(buf, offset: 0, index: 0)
+        enc.setBuffer(bias.buffer, offset: 0, index: 1)
+        enc.setBytes(&n, length: 4, index: 2)
+        enc.dispatchThreads(MTLSize(width: M * N, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+}
+
+/// Cast f32 buffer → f16 Tensor
+public func castF32toF16(_ buf: MTLBuffer, count: Int, shape: [Int]) -> Tensor {
+    let out = Tensor.empty(shape, dtype: .float16)
+    let pipe = KernelCache.shared.pipeline("cast_f32_to_f16")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(buf, offset: 0, index: 0)
+        enc.setBuffer(out.buffer, offset: 0, index: 1)
+        enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+    return out
+}
+
+/// Cast f16 Tensor → f32 MTLBuffer
+public func castF16toF32(_ x: Tensor) -> MTLBuffer {
+    let count = x.count
+    let buf = MetalContext.shared.device.makeBuffer(length: count * 4, options: .storageModeShared)!
+    let pipe = KernelCache.shared.pipeline("cast_f16_to_f32")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(x.buffer, offset: 0, index: 0)
+        enc.setBuffer(buf, offset: 0, index: 1)
+        enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+    return buf
+}
+
+/// In-place add f16 tensor to f32 buffer: acc[i] += x[i]
+public func elemAddF32F16(_ acc: MTLBuffer, _ x: Tensor) {
+    let pipe = KernelCache.shared.pipeline("elem_add_f32_f16")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(acc, offset: 0, index: 0)
+        enc.setBuffer(x.buffer, offset: 0, index: 1)
+        enc.dispatchThreads(MTLSize(width: x.count, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+}
+
+/// In-place add f32: acc[i] += b[i]
+public func elemAddF32(_ acc: MTLBuffer, _ b: MTLBuffer, count: Int) {
+    let pipe = KernelCache.shared.pipeline("elem_add_f32_inplace")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(acc, offset: 0, index: 0)
+        enc.setBuffer(b, offset: 0, index: 1)
+        enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+}
+
+/// RMS Norm with f32 input → f16 output. Avoids clipping large f32 residual values.
+public func rmsNormF32in(_ x: MTLBuffer, weight: Tensor, eps: Float, dim: Int, rows: Int) -> Tensor {
+    let out = Tensor.empty([rows, dim], dtype: .float16)
+    let pipe = KernelCache.shared.pipeline("rms_norm_f32in")
+    var d = UInt32(dim)
+    var e = eps
+    let tgSize = min(256, dim)
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(x, offset: 0, index: 0)
+        enc.setBuffer(weight.buffer, offset: 0, index: 1)
+        enc.setBuffer(out.buffer, offset: 0, index: 2)
+        enc.setBytes(&d, length: 4, index: 3)
+        enc.setBytes(&e, length: 4, index: 4)
+        enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
+    }
+    return out
+}
+
+/// AdaLN modulate with f32 input: out = x * (1+scale) + shift. Output f16.
+public func adalnModulateF32in(_ x: MTLBuffer, scale: Tensor, shift: Tensor, count: Int) -> Tensor {
+    let out = Tensor.empty(scale.shape, dtype: .float16)
+    let pipe = KernelCache.shared.pipeline("adaln_modulate_f32in")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(x, offset: 0, index: 0)
+        enc.setBuffer(scale.buffer, offset: 0, index: 1)
+        enc.setBuffer(shift.buffer, offset: 0, index: 2)
+        enc.setBuffer(out.buffer, offset: 0, index: 3)
+        enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+    return out
+}
+
+/// Element-wise multiply f32 * f16 → f16 output
+public func elemMulF32inF16(_ a: MTLBuffer, _ b: Tensor, count: Int) -> Tensor {
+    let out = Tensor.empty(b.shape, dtype: .float16)
+    let pipe = KernelCache.shared.pipeline("elem_mul_f32in_f16")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(a, offset: 0, index: 0)
+        enc.setBuffer(b.buffer, offset: 0, index: 1)
+        enc.setBuffer(out.buffer, offset: 0, index: 2)
+        enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+    return out
+}
+
+/// Element-wise multiply: out[i] = a_f32[i] * b_f16[i]
+public func elemMulF32F16(_ a: MTLBuffer, _ b: Tensor, count: Int) -> MTLBuffer {
+    let out = MetalContext.shared.device.makeBuffer(length: count * 4, options: .storageModeShared)!
+    let pipe = KernelCache.shared.pipeline("elem_mul_f32_f16")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(a, offset: 0, index: 0)
+        enc.setBuffer(b.buffer, offset: 0, index: 1)
+        enc.setBuffer(out, offset: 0, index: 2)
+        enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
     return out
 }
@@ -898,6 +1151,720 @@ public func linearF16(_ x: Tensor, weight: Tensor, bias: Tensor, B: Int, K: Int,
                            threadsPerThreadgroup: MTLSize(width: min(256, N), height: 1, depth: 1))
     }
     return out
+}
+
+// MARK: - DiT Ops
+
+/// GELU approximate (tanh variant).
+public func geluApproximate(_ x: Tensor) -> Tensor {
+    let out = Tensor.empty(x.shape, dtype: .float16)
+    let pipe = KernelCache.shared.pipeline("gelu_approximate")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(x.buffer, offset: 0, index: 0)
+        enc.setBuffer(out.buffer, offset: 0, index: 1)
+        enc.dispatchThreads(MTLSize(width: x.count, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+    return out
+}
+
+/// Fused GEGLU: gelu_approx(a) * b. a and b must have same shape.
+public func geglu(_ a: Tensor, _ b: Tensor) -> Tensor {
+    let out = Tensor.empty(a.shape, dtype: .float16)
+    let pipe = KernelCache.shared.pipeline("geglu")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(a.buffer, offset: 0, index: 0)
+        enc.setBuffer(b.buffer, offset: 0, index: 1)
+        enc.setBuffer(out.buffer, offset: 0, index: 2)
+        enc.dispatchThreads(MTLSize(width: a.count, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+    return out
+}
+
+/// Layer Norm: (x - mean) / sqrt(var + eps) * weight + bias.
+/// x: [..., dim], weight/bias: [dim] f16.
+/// Layer norm with f32 input → f16 output.
+public func layerNormF32in(_ x: MTLBuffer, weight: Tensor, bias: Tensor, dim: Int, rows: Int, eps: Float = 1e-6) -> Tensor {
+    let out = Tensor.empty([rows, dim], dtype: .float16)
+    var d = UInt32(dim)
+    var e = eps
+    let tgSize = min(256, dim)
+    let pipe = KernelCache.shared.pipeline("layer_norm_f32in")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(x, offset: 0, index: 0)
+        enc.setBuffer(weight.buffer, offset: 0, index: 1)
+        enc.setBuffer(bias.buffer, offset: 0, index: 2)
+        enc.setBuffer(out.buffer, offset: 0, index: 3)
+        enc.setBytes(&d, length: 4, index: 4)
+        enc.setBytes(&e, length: 4, index: 5)
+        enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
+    }
+    return out
+}
+
+public func layerNorm(_ x: Tensor, weight: Tensor, bias: Tensor, dim: Int, eps: Float = 1e-6) -> Tensor {
+    let rows = x.count / dim
+    let out = Tensor.empty(x.shape, dtype: .float16)
+    var d = UInt32(dim)
+    var e = eps
+    let tgSize = min(256, dim)
+    let pipe = KernelCache.shared.pipeline("layer_norm")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(x.buffer, offset: 0, index: 0)
+        enc.setBuffer(weight.buffer, offset: 0, index: 1)
+        enc.setBuffer(bias.buffer, offset: 0, index: 2)
+        enc.setBuffer(out.buffer, offset: 0, index: 3)
+        enc.setBytes(&d, length: 4, index: 4)
+        enc.setBytes(&e, length: 4, index: 5)
+        enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
+    }
+    return out
+}
+
+/// AdaLN modulate: out = x * (1 + scale) + shift. All same shape.
+public func adalnModulate(_ x: Tensor, scale: Tensor, shift: Tensor) -> Tensor {
+    let out = Tensor.empty(x.shape, dtype: .float16)
+    let pipe = KernelCache.shared.pipeline("adaln_modulate")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(x.buffer, offset: 0, index: 0)
+        enc.setBuffer(scale.buffer, offset: 0, index: 1)
+        enc.setBuffer(shift.buffer, offset: 0, index: 2)
+        enc.setBuffer(out.buffer, offset: 0, index: 3)
+        enc.dispatchThreads(MTLSize(width: x.count, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+    return out
+}
+
+// MARK: - DiT F32 Ops
+
+/// SiLU f32: out = x / (1 + exp(-x))
+public func siluF32(_ x: MTLBuffer, count: Int) -> MTLBuffer {
+    let out = MetalContext.shared.device.makeBuffer(length: count * 4, options: .storageModeShared)!
+    let pipe = KernelCache.shared.pipeline("silu_f32")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(x, offset: 0, index: 0)
+        enc.setBuffer(out, offset: 0, index: 1)
+        enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+    return out
+}
+
+/// Element-wise multiply f32
+public func elemMulF32(_ a: MTLBuffer, _ b: MTLBuffer, count: Int) -> MTLBuffer {
+    let out = MetalContext.shared.device.makeBuffer(length: count * 4, options: .storageModeShared)!
+    let pipe = KernelCache.shared.pipeline("mul_f32")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(a, offset: 0, index: 0)
+        enc.setBuffer(b, offset: 0, index: 1)
+        enc.setBuffer(out, offset: 0, index: 2)
+        enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+    return out
+}
+
+/// 1 + x element-wise f32
+public func onePlusF32(_ x: MTLBuffer, count: Int) -> MTLBuffer {
+    let out = MetalContext.shared.device.makeBuffer(length: count * 4, options: .storageModeShared)!
+    let pipe = KernelCache.shared.pipeline("one_plus_f32")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(x, offset: 0, index: 0)
+        enc.setBuffer(out, offset: 0, index: 1)
+        enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+    return out
+}
+
+/// Broadcast [B, dim] → [B, numTokens, dim] f32
+public func broadcastToSeqF32(_ x: MTLBuffer, numTokens: Int, dim: Int, B: Int) -> MTLBuffer {
+    if numTokens == 1 { return x }
+    let total = B * numTokens * dim
+    let out = MetalContext.shared.device.makeBuffer(length: total * 4, options: .storageModeShared)!
+    var n = UInt32(numTokens), d = UInt32(dim)
+    let pipe = KernelCache.shared.pipeline("broadcast_seq_f32")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(x, offset: 0, index: 0)
+        enc.setBuffer(out, offset: 0, index: 1)
+        enc.setBytes(&n, length: 4, index: 2)
+        enc.setBytes(&d, length: 4, index: 3)
+        enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+    return out
+}
+
+/// AdaLN modulate f32: out = x * (1 + scale) + shift
+public func adalnModulateF32(_ x: MTLBuffer, scale: MTLBuffer, shift: MTLBuffer, count: Int) -> MTLBuffer {
+    let out = MetalContext.shared.device.makeBuffer(length: count * 4, options: .storageModeShared)!
+    let pipe = KernelCache.shared.pipeline("adaln_modulate_f32")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(x, offset: 0, index: 0)
+        enc.setBuffer(scale, offset: 0, index: 1)
+        enc.setBuffer(shift, offset: 0, index: 2)
+        enc.setBuffer(out, offset: 0, index: 3)
+        enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+    return out
+}
+
+/// 3D RoPE f32
+public func rope3DF32(_ x: MTLBuffer, cosFreqs: MTLBuffer, sinFreqs: MTLBuffer, dim: Int, count: Int) -> MTLBuffer {
+    let out = MetalContext.shared.device.makeBuffer(length: count * 4, options: .storageModeShared)!
+    let batchSeq = count / dim
+    let pairs = dim / 2
+    var d = UInt32(dim)
+    let pipe = KernelCache.shared.pipeline("rope_3d_f32")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(x, offset: 0, index: 0)
+        enc.setBuffer(out, offset: 0, index: 1)
+        enc.setBuffer(cosFreqs, offset: 0, index: 2)
+        enc.setBuffer(sinFreqs, offset: 0, index: 3)
+        enc.setBytes(&d, length: 4, index: 4)
+        enc.dispatchThreads(MTLSize(width: pairs, height: batchSeq, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: min(pairs, 256), height: 1, depth: 1))
+    }
+    return out
+}
+
+/// Transpose [seqLen, nHeads, headDim] → [nHeads, seqLen, headDim] f32
+public func transposeSHF32(_ x: MTLBuffer, seqLen: Int, nHeads: Int, headDim: Int) -> MTLBuffer {
+    let count = seqLen * nHeads * headDim
+    let out = MetalContext.shared.device.makeBuffer(length: count * 4, options: .storageModeShared)!
+    var sl = UInt32(seqLen), nh = UInt32(nHeads), hd = UInt32(headDim)
+    let pipe = KernelCache.shared.pipeline("transpose_sh_f32")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(x, offset: 0, index: 0)
+        enc.setBuffer(out, offset: 0, index: 1)
+        enc.setBytes(&sl, length: 4, index: 2)
+        enc.setBytes(&nh, length: 4, index: 3)
+        enc.setBytes(&hd, length: 4, index: 4)
+        enc.dispatchThreads(MTLSize(width: headDim, height: seqLen * nHeads, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: min(headDim, 256), height: 1, depth: 1))
+    }
+    return out
+}
+
+/// Transpose [nHeads, seqLen, headDim] → [seqLen, nHeads, headDim] f32
+public func transposeHSF32(_ x: MTLBuffer, seqLen: Int, nHeads: Int, headDim: Int) -> MTLBuffer {
+    let count = nHeads * seqLen * headDim
+    let out = MetalContext.shared.device.makeBuffer(length: count * 4, options: .storageModeShared)!
+    var sl = UInt32(seqLen), nh = UInt32(nHeads), hd = UInt32(headDim)
+    let pipe = KernelCache.shared.pipeline("transpose_hs_f32")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(x, offset: 0, index: 0)
+        enc.setBuffer(out, offset: 0, index: 1)
+        enc.setBytes(&sl, length: 4, index: 2)
+        enc.setBytes(&nh, length: 4, index: 3)
+        enc.setBytes(&hd, length: 4, index: 4)
+        enc.dispatchThreads(MTLSize(width: headDim, height: nHeads * seqLen, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: min(headDim, 256), height: 1, depth: 1))
+    }
+    return out
+}
+
+/// RMS Norm f32 input → f32 output
+public func rmsNormF32(_ x: MTLBuffer, weight: Tensor, eps: Float, dim: Int, rows: Int) -> MTLBuffer {
+    let out = MetalContext.shared.device.makeBuffer(length: rows * dim * 4, options: .storageModeShared)!
+    let pipe = KernelCache.shared.pipeline("rms_norm_f32")
+    var d = UInt32(dim)
+    var e = eps
+    let tgSize = min(256, dim)
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(x, offset: 0, index: 0)
+        enc.setBuffer(weight.buffer, offset: 0, index: 1)
+        enc.setBuffer(out, offset: 0, index: 2)
+        enc.setBytes(&d, length: 4, index: 3)
+        enc.setBytes(&e, length: 4, index: 4)
+        enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
+    }
+    return out
+}
+
+/// Layer norm f32 input → f32 output. Weight/bias must be f32.
+public func layerNormF32(_ x: MTLBuffer, weight: MTLBuffer, bias: MTLBuffer, dim: Int, rows: Int, eps: Float = 1e-6) -> MTLBuffer {
+    let out = MetalContext.shared.device.makeBuffer(length: rows * dim * 4, options: .storageModeShared)!
+    var d = UInt32(dim)
+    var e = eps
+    let tgSize = min(256, dim)
+    let pipe = KernelCache.shared.pipeline("layer_norm_f32")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(x, offset: 0, index: 0)
+        enc.setBuffer(weight, offset: 0, index: 1)
+        enc.setBuffer(bias, offset: 0, index: 2)
+        enc.setBuffer(out, offset: 0, index: 3)
+        enc.setBytes(&d, length: 4, index: 4)
+        enc.setBytes(&e, length: 4, index: 5)
+        enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
+    }
+    return out
+}
+
+/// Timestep embedding f32 output. Input: [B] float, Output: [B, dim] f32 MTLBuffer.
+public func timestepEmbeddingF32(_ timesteps: Tensor, B: Int, dim: Int) -> MTLBuffer {
+    let out = MetalContext.shared.device.makeBuffer(length: B * dim * 4, options: .storageModeShared)!
+    var d = UInt32(dim)
+    let pipe = KernelCache.shared.pipeline("timestep_embedding_f32")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(timesteps.buffer, offset: 0, index: 0)
+        enc.setBuffer(out, offset: 0, index: 1)
+        enc.setBytes(&d, length: 4, index: 2)
+        enc.dispatchThreads(MTLSize(width: dim, height: B, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: min(256, dim), height: 1, depth: 1))
+    }
+    return out
+}
+
+/// GELU approximate f32 (wrapper for MTLBuffer API)
+public func geluApproximateF32(_ x: MTLBuffer, count: Int) -> MTLBuffer {
+    let out = MetalContext.shared.device.makeBuffer(length: count * 4, options: .storageModeShared)!
+    let pipe = KernelCache.shared.pipeline("gelu_approximate_f32")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(x, offset: 0, index: 0)
+        enc.setBuffer(out, offset: 0, index: 1)
+        enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+    return out
+}
+
+/// GEGLU f32 (wrapper for MTLBuffer API)
+public func gegluF32(_ gate: MTLBuffer, _ value: MTLBuffer, count: Int) -> MTLBuffer {
+    let out = MetalContext.shared.device.makeBuffer(length: count * 4, options: .storageModeShared)!
+    let pipe = KernelCache.shared.pipeline("geglu_f32")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(gate, offset: 0, index: 0)
+        enc.setBuffer(value, offset: 0, index: 1)
+        enc.setBuffer(out, offset: 0, index: 2)
+        enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+    return out
+}
+
+/// AdaLN combine2 f32: table[2,C] (f16) + tsEmb[B,2C] (f32) → 2 separate [B,C] f32 buffers.
+/// NOTE: tsEmb must be [B, 2*C] layout where each batch has 2*C elements.
+public func adaLNCombine2F32(_ tsEmb: MTLBuffer, table: Tensor, B: Int, C: Int) -> (MTLBuffer, MTLBuffer) {
+    let total = B * C
+    let out0 = MetalContext.shared.device.makeBuffer(length: total * 4, options: .storageModeShared)!
+    let out1 = MetalContext.shared.device.makeBuffer(length: total * 4, options: .storageModeShared)!
+    var c = UInt32(C)
+    let pipe = KernelCache.shared.pipeline("ada_ln_combine2_f32")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(table.buffer, offset: 0, index: 0)
+        enc.setBuffer(tsEmb, offset: 0, index: 1)
+        enc.setBuffer(out0, offset: 0, index: 2)
+        enc.setBuffer(out1, offset: 0, index: 3)
+        enc.setBytes(&c, length: 4, index: 4)
+        enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+    return (out0, out1)
+}
+
+/// AdaLN combine2 shared f32: table[2,C] (f16) + tsEmb[B,C] (f32, SHARED for both outputs) → 2 × [B,C] f32.
+/// Use when tsEmb is [B,C] (not [B,2C]) — both outputs add the same tsEmb, differ only by table row.
+public func adaLNCombine2SharedF32(_ tsEmb: MTLBuffer, table: Tensor, B: Int, C: Int) -> (MTLBuffer, MTLBuffer) {
+    let total = B * C
+    let out0 = MetalContext.shared.device.makeBuffer(length: total * 4, options: .storageModeShared)!
+    let out1 = MetalContext.shared.device.makeBuffer(length: total * 4, options: .storageModeShared)!
+    var c = UInt32(C)
+    let pipe = KernelCache.shared.pipeline("ada_ln_combine2_shared_f32")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(table.buffer, offset: 0, index: 0)
+        enc.setBuffer(tsEmb, offset: 0, index: 1)
+        enc.setBuffer(out0, offset: 0, index: 2)
+        enc.setBuffer(out1, offset: 0, index: 3)
+        enc.setBytes(&c, length: 4, index: 4)
+        enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+    return (out0, out1)
+}
+
+/// Add f32 bias (f32) to f32 buffer in-place
+public func addBiasF32F32(_ buf: MTLBuffer, bias: MTLBuffer, M: Int, N: Int) {
+    let pipe = KernelCache.shared.pipeline("broadcast_bias_add_f32_f32")
+    var n = UInt32(N)
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(buf, offset: 0, index: 0)
+        enc.setBuffer(bias, offset: 0, index: 1)
+        enc.setBytes(&n, length: 4, index: 2)
+        enc.dispatchThreads(MTLSize(width: M * N, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+}
+
+// MARK: - F32 Pipeline Ops (Phase 3)
+
+/// Per-channel scale+bias f32: out = x * scale[c] + bias[c]. All f32 MTLBuffers.
+public func channelScaleBiasF32(x: MTLBuffer, scale: MTLBuffer, bias: MTLBuffer,
+                                 B: Int, C: Int, spatial: Int) -> MTLBuffer {
+    let total = B * C * spatial
+    let out = MetalContext.shared.device.makeBuffer(length: total * 4, options: .storageModeShared)!
+    let pipe = KernelCache.shared.pipeline("channel_scale_bias_f32")
+    var cU = UInt32(C), sU = UInt32(spatial)
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(x, offset: 0, index: 0)
+        enc.setBuffer(scale, offset: 0, index: 1)
+        enc.setBuffer(bias, offset: 0, index: 2)
+        enc.setBuffer(out, offset: 0, index: 3)
+        enc.setBytes(&cU, length: 4, index: 4)
+        enc.setBytes(&sU, length: 4, index: 5)
+        enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+    return out
+}
+
+/// 3D Convolution f32 — all buffers are f32.
+public func conv3dF32(_ x: MTLBuffer, weight: MTLBuffer, bias: MTLBuffer,
+                       B: Int, C_in: Int, D: Int, H: Int, W: Int,
+                       C_out: Int, kD: Int, kH: Int, kW: Int,
+                       sD: Int = 1, sH: Int = 1, sW: Int = 1,
+                       pD: Int = 0, pH: Int = 0, pW: Int = 0) -> MTLBuffer {
+    let D_out = (D + 2*pD - kD) / sD + 1
+    let H_out = (H + 2*pH - kH) / sH + 1
+    let W_out = (W + 2*pW - kW) / sW + 1
+    let outCount = B * C_out * D_out * H_out * W_out
+
+    let isPointwise = kD == 1 && kH == 1 && kW == 1 && sD == 1 && sH == 1 && sW == 1 && pD == 0 && pH == 0 && pW == 0
+
+    if isPointwise {
+        let out = MetalContext.shared.device.makeBuffer(length: outCount * 4, options: .storageModeShared)!
+        let spatialSize = D * H * W
+        let tgSize = min(C_out, 256)
+        let tileC = min(C_in, 1024)
+        var params: [UInt32] = [UInt32(C_in), UInt32(spatialSize), UInt32(C_out), UInt32(tileC)]
+        let smemBytes = tileC * 4  // float
+        let pipe = KernelCache.shared.pipeline("conv3d_1x1x1_f32")
+        MetalContext.shared.run { enc in
+            enc.setComputePipelineState(pipe)
+            enc.setBuffer(x, offset: 0, index: 0)
+            enc.setBuffer(weight, offset: 0, index: 1)
+            enc.setBuffer(bias, offset: 0, index: 2)
+            enc.setBuffer(out, offset: 0, index: 3)
+            enc.setBytes(&params, length: params.count * 4, index: 4)
+            enc.setThreadgroupMemoryLength(smemBytes, index: 0)
+            enc.dispatchThreadgroups(MTLSize(width: spatialSize, height: B, depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
+        }
+        return out
+    }
+
+    // General path: im2col + single GEMM + scatter
+    let kSize = kD * kH * kW
+    let spatialOut = D_out * H_out * W_out
+    let M = B * D_out * H_out * W_out
+    let K = C_in * kSize
+    let out = MetalContext.shared.device.makeBuffer(length: outCount * 4, options: .storageModeShared)!
+    let ctx = MetalContext.shared
+
+    // im2col: build [M, C_in * kSize] matrix
+    let im2colBuf = ctx.device.makeBuffer(length: M * K * 4, options: .storageModeShared)!
+    var im2colParams: [UInt32] = [
+        UInt32(C_in), UInt32(D), UInt32(H), UInt32(W),
+        UInt32(D_out), UInt32(H_out), UInt32(W_out),
+        UInt32(kD), UInt32(kH), UInt32(kW),
+        UInt32(sD), UInt32(sH), UInt32(sW),
+        UInt32(pD), UInt32(pH), UInt32(pW)
+    ]
+    let im2colPipe = KernelCache.shared.pipeline("im2col_3d_f32")
+    ctx.run { enc in
+        enc.setComputePipelineState(im2colPipe)
+        enc.setBuffer(x, offset: 0, index: 0)
+        enc.setBuffer(im2colBuf, offset: 0, index: 1)
+        enc.setBytes(&im2colParams, length: im2colParams.count * 4, index: 2)
+        enc.dispatchThreads(MTLSize(width: K, height: M, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: min(256, K), height: 1, depth: 1))
+    }
+
+    // Single GEMM: [M, K] × [C_out, K]^T → [M, C_out]
+    // Weight is [C_out, C_in, kD, kH, kW] = [C_out, K] row-major — already correct for B^T
+    let gemmResult = matmulF32xF32(im2colBuf, weight, M: M, K: K, N: C_out)
+
+    // Scatter [M, C_out] row-major → [B, C_out, spatial] NCHW + bias
+    var scatterParams: [UInt32] = [UInt32(C_out), UInt32(spatialOut)]
+    let scatterPipe = KernelCache.shared.pipeline("scatter_conv_output_f32")
+    ctx.run { enc in
+        enc.setComputePipelineState(scatterPipe)
+        enc.setBuffer(gemmResult, offset: 0, index: 0)
+        enc.setBuffer(bias, offset: 0, index: 1)
+        enc.setBuffer(out, offset: 0, index: 2)
+        enc.setBytes(&scatterParams, length: scatterParams.count * 4, index: 3)
+        enc.dispatchThreads(MTLSize(width: M * C_out, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+    return out
+}
+
+/// Group norm 3D f32. Input/output f32 MTLBuffer.
+public func groupNorm3dF32(_ x: MTLBuffer, weight: Tensor, bias: Tensor,
+                            B: Int, C: Int, spatialSize: Int,
+                            numGroups: Int, eps: Float = 1e-6) -> MTLBuffer {
+    let total = B * C * spatialSize
+    let out = MetalContext.shared.device.makeBuffer(length: total * 4, options: .storageModeShared)!
+    var c = UInt32(C)
+    var s = UInt32(spatialSize)
+    var ng = UInt32(numGroups)
+    var e = eps
+    let pipe = KernelCache.shared.pipeline("group_norm_3d_f32")
+    let tgSize = min(256, C / numGroups * spatialSize)
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(x, offset: 0, index: 0)
+        enc.setBuffer(weight.buffer, offset: 0, index: 1)
+        enc.setBuffer(bias.buffer, offset: 0, index: 2)
+        enc.setBuffer(out, offset: 0, index: 3)
+        enc.setBytes(&c, length: 4, index: 4)
+        enc.setBytes(&s, length: 4, index: 5)
+        enc.setBytes(&ng, length: 4, index: 6)
+        enc.setBytes(&e, length: 4, index: 7)
+        enc.dispatchThreadgroups(MTLSize(width: numGroups, height: B, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
+    }
+    return out
+}
+
+/// Pixel shuffle 3D f32: [B, C*p1*p2*p3, D, H, W] → [B, C, D*p1, H*p2, W*p3]
+public func pixelShuffle3dF32(_ x: MTLBuffer, B: Int, C_out: Int, D_in: Int, H_in: Int, W_in: Int,
+                               p1: Int, p2: Int, p3: Int) -> MTLBuffer {
+    let D_out = D_in * p1, H_out = H_in * p2, W_out = W_in * p3
+    let total = B * C_out * D_out * H_out * W_out
+    let out = MetalContext.shared.device.makeBuffer(length: total * 4, options: .storageModeShared)!
+    var params: [UInt32] = [UInt32(C_out), UInt32(D_out), UInt32(H_out), UInt32(W_out),
+                            UInt32(p1), UInt32(p2), UInt32(p3), UInt32(B)]
+    let pipe = KernelCache.shared.pipeline("pixel_shuffle_3d_f32")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(x, offset: 0, index: 0)
+        enc.setBuffer(out, offset: 0, index: 1)
+        enc.setBytes(&params, length: params.count * 4, index: 2)
+        enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+    return out
+}
+
+/// Element-wise add f32 (out-of-place): out = a + b
+public func elemAddF32OOP(_ a: MTLBuffer, _ b: MTLBuffer, count: Int) -> MTLBuffer {
+    let out = MetalContext.shared.device.makeBuffer(length: count * 4, options: .storageModeShared)!
+    let pipe = KernelCache.shared.pipeline("elem_add_f32_oop")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(a, offset: 0, index: 0)
+        enc.setBuffer(b, offset: 0, index: 1)
+        enc.setBuffer(out, offset: 0, index: 2)
+        enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+    return out
+}
+
+/// Broadcast f32 RoPE freqs [numTokens, dim] → [B, numTokens, dim] f32.
+public func broadcastRoPEF32(_ freqs: MTLBuffer, B: Int, seqLen: Int, dim: Int) -> MTLBuffer {
+    if B == 1 { return freqs }
+    let bytes = seqLen * dim * 4
+    let out = MetalContext.shared.device.makeBuffer(length: B * bytes, options: .storageModeShared)!
+    for b in 0..<B {
+        memcpy(out.contents() + b * bytes, freqs.contents(), bytes)
+    }
+    return out
+}
+
+/// Flash attention bidirectional with f32 buffers (no f16 conversion needed).
+/// Q/K/V: MTLBuffer f32, [nHeads, seqLen, headDim]. Returns f32 MTLBuffer [nHeads, R, D].
+public func flashAttentionBidirectionalF32(
+    q: MTLBuffer, k: MTLBuffer, v: MTLBuffer,
+    R: Int, C: Int, D: Int, nHeads: Int
+) -> MTLBuffer {
+    var attDesc = AttentionDescriptor()
+    attDesc.lowPrecisionInputs = false
+    attDesc.lowPrecisionIntermediates = false
+    attDesc.lowPrecisionOutputs = false
+    attDesc.matrixDimensions = (row: UInt32(R), column: UInt32(C), head: UInt16(D))
+    attDesc.transposeState = (Q: false, K: false, V: false, O: false)
+    attDesc.causal = false
+
+    let (kernel, pipeline) = AttentionKernel.pipeline(for: attDesc, type: .forward)
+
+    let pool = MetalContext.shared.bufferPool
+    let oBytes = nHeads * R * D * 4
+    let lBytes = nHeads * R * 4
+    let bufO = pool.get(length: oBytes)
+    let bufL = pool.get(length: lBytes)
+    let dummy = pool.get(length: 16)
+    gpuZero(bufO, bytes: oBytes)
+    gpuZero(bufL, bytes: lBytes)
+    gpuZero(dummy, bytes: 16)
+
+    let d = UInt32(D)
+    var params: [UInt32] = [
+        UInt32(nHeads), 1,
+        UInt32(R) * d, UInt32(C) * d, UInt32(C) * d,
+        UInt32(R) * d, UInt32(R), UInt32(R),
+        UInt32(R) * d, UInt32(C) * d, UInt32(C) * d, UInt32(R) * d,
+        0, UInt32(R), UInt32(C)
+    ]
+    let batchParams = MetalContext.shared.device.makeBuffer(
+        bytes: &params, length: params.count * 4, options: .storageModeShared)!
+
+    MetalContext.shared.run { enc in
+        enc.setBuffer(q, offset: 0, index: 0)
+        enc.setBuffer(k, offset: 0, index: 1)
+        enc.setBuffer(v, offset: 0, index: 2)
+        enc.setBuffer(bufO, offset: 0, index: 3)
+        enc.setBuffer(bufL, offset: 0, index: 4)
+        enc.setBuffer(dummy, offset: 0, index: 5)
+        enc.setBuffer(dummy, offset: 0, index: 6)
+        enc.setBuffer(dummy, offset: 0, index: 7)
+        enc.setBuffer(dummy, offset: 0, index: 8)
+        enc.setBuffer(dummy, offset: 0, index: 9)
+        AttentionKernel.dispatch(
+            encoder: enc, kernel: kernel, pipeline: pipeline,
+            batchedParams: batchParams, parallelizationDimension: R,
+            numHeads: nHeads, batchSize: 1)
+    }
+    return bufO
+}
+
+/// 3D RoPE: apply precomputed cos/sin freqs to x.
+/// x: [B, seqLen, dim], cosFreqs/sinFreqs: [B, seqLen, dim] (f16).
+public func rope3D(_ x: Tensor, cosFreqs: Tensor, sinFreqs: Tensor, dim: Int) -> Tensor {
+    let out = Tensor.empty(x.shape, dtype: .float16)
+    let batchSeq = x.count / dim
+    let pairs = dim / 2
+    var d = UInt32(dim)
+    let pipe = KernelCache.shared.pipeline("rope_3d")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(x.buffer, offset: 0, index: 0)
+        enc.setBuffer(out.buffer, offset: 0, index: 1)
+        enc.setBuffer(cosFreqs.buffer, offset: 0, index: 2)
+        enc.setBuffer(sinFreqs.buffer, offset: 0, index: 3)
+        enc.setBytes(&d, length: 4, index: 4)
+        enc.dispatchThreads(MTLSize(width: pairs, height: batchSeq, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: min(pairs, 256), height: 1, depth: 1))
+    }
+    return out
+}
+
+/// Bidirectional flash attention (no causal mask) for DiT.
+/// Q: [nHeads, R, D], K: [nHeads, C, D], V: [nHeads, C, D] — all f16, contiguous.
+/// Returns: [nHeads, R, D] f16.
+public func flashAttentionBidirectional(
+    q: Tensor, k: Tensor, v: Tensor,
+    R: Int, C: Int, D: Int, nHeads: Int
+) -> Tensor {
+    // Cast f16 inputs to f32 for full-precision attention (avoids clipping large activations)
+    let qF32 = castF16toF32(q)
+    let kF32 = castF16toF32(k)
+    let vF32 = castF16toF32(v)
+
+    var attDesc = AttentionDescriptor()
+    attDesc.lowPrecisionInputs = false
+    attDesc.lowPrecisionIntermediates = false
+    attDesc.lowPrecisionOutputs = false
+    attDesc.matrixDimensions = (row: UInt32(R), column: UInt32(C), head: UInt16(D))
+    attDesc.transposeState = (Q: false, K: false, V: false, O: false)
+    attDesc.causal = false
+
+    let (kernel, pipeline) = AttentionKernel.pipeline(for: attDesc, type: .forward)
+
+    let pool = MetalContext.shared.bufferPool
+    let oBytes = nHeads * R * D * 4  // f32 output
+    let lBytes = nHeads * R * 4
+    let bufO = pool.get(length: oBytes)
+    let bufL = pool.get(length: lBytes)
+    let dummy = pool.get(length: 16)
+    gpuZero(bufO, bytes: oBytes)
+    gpuZero(bufL, bytes: lBytes)
+    gpuZero(dummy, bytes: 16)
+
+    let d = UInt32(D)
+    var params: [UInt32] = [
+        UInt32(nHeads),         // 0: numHeads
+        1,                      // 1: kvRepeatFactor (no GQA in DiT)
+        UInt32(R) * d,          // 2: Q stride
+        UInt32(C) * d,          // 3: K stride
+        UInt32(C) * d,          // 4: V stride
+        UInt32(R) * d,          // 5: O stride
+        UInt32(R),              // 6: L stride
+        UInt32(R),              // 7: D stride
+        UInt32(R) * d,          // 8: dO stride
+        UInt32(C) * d,          // 9: dV stride
+        UInt32(C) * d,          // 10: dK stride
+        UInt32(R) * d,          // 11: dQ stride
+        0,                      // 12: causalOffset
+        UInt32(R),              // 13: R
+        UInt32(C)               // 14: C
+    ]
+    let batchParams = MetalContext.shared.device.makeBuffer(
+        bytes: &params, length: params.count * 4, options: .storageModeShared)!
+
+    MetalContext.shared.run { enc in
+        enc.setBuffer(qF32, offset: 0, index: 0)
+        enc.setBuffer(kF32, offset: 0, index: 1)
+        enc.setBuffer(vF32, offset: 0, index: 2)
+        enc.setBuffer(bufO, offset: 0, index: 3)
+        enc.setBuffer(bufL, offset: 0, index: 4)
+        enc.setBuffer(dummy, offset: 0, index: 5)
+        enc.setBuffer(dummy, offset: 0, index: 6)
+        enc.setBuffer(dummy, offset: 0, index: 7)
+        enc.setBuffer(dummy, offset: 0, index: 8)
+        enc.setBuffer(dummy, offset: 0, index: 9)
+
+        AttentionKernel.dispatch(
+            encoder: enc,
+            kernel: kernel,
+            pipeline: pipeline,
+            batchedParams: batchParams,
+            parallelizationDimension: R,
+            numHeads: nHeads,
+            batchSize: 1)
+    }
+
+    // Cast f32 output back to f16
+    return castF32toF16(bufO, count: nHeads * R * D, shape: [nHeads, R, D])
+}
+
+/// Cross-attention via flash attention (bidirectional, Q/K may differ in seq length).
+/// Same as flashAttentionBidirectional but named for clarity.
+public func flashCrossAttention(
+    q: Tensor, k: Tensor, v: Tensor,
+    R: Int, C: Int, D: Int, nHeads: Int
+) -> Tensor {
+    return flashAttentionBidirectional(q: q, k: k, v: v, R: R, C: C, D: D, nHeads: nHeads)
 }
 
 private func sampleFromLogits(_ logits: inout [Float], temperature: Float, topP: Float) -> Int {

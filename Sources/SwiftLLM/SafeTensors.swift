@@ -85,10 +85,23 @@ public class SafeTensorsFile {
     }
 
     /// Get a raw pointer to tensor data. Zero-copy via mmap.
+    /// NOTE: The pointer is only valid while the SafeTensorsFile is alive (mmap-backed).
     public func pointer(for name: String) -> UnsafeRawPointer? {
         guard let info = tensors[name] else { return nil }
+        // fileData is mmap'd and retained by self, so the pointer remains valid
+        // as long as self is alive. We use withUnsafeBytes to get the base, then
+        // compute the offset. The mmap backing keeps the memory valid.
         return fileData.withUnsafeBytes { ptr in
             ptr.baseAddress! + dataOffset + info.offset
+        }
+    }
+
+    /// Access tensor data safely within a closure where the pointer is guaranteed valid.
+    public func withPointer<R>(for name: String, body: (UnsafeRawPointer, TensorInfo) throws -> R) rethrows -> R? {
+        guard let info = tensors[name] else { return nil }
+        return try fileData.withUnsafeBytes { ptr in
+            let p = ptr.baseAddress! + dataOffset + info.offset
+            return try body(p, info)
         }
     }
 

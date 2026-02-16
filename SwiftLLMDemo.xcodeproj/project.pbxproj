@@ -12,6 +12,8 @@
 		A1000003 /* DemoRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000003 /* DemoRunner.swift */; };
 		A1000004 /* VAERunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000005 /* VAERunner.swift */; };
 		A1000005 /* VAEView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000006 /* VAEView.swift */; };
+		A1000006 /* VideoRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000007 /* VideoRunner.swift */; };
+		A1000007 /* VideoView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000008 /* VideoView.swift */; };
 		A1000010 /* SwiftLLM in Frameworks */ = {isa = PBXBuildFile; productRef = A5000001 /* SwiftLLM */; };
 /* End PBXBuildFile section */
 
@@ -22,6 +24,8 @@
 		A2000004 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A2000005 /* VAERunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VAERunner.swift; sourceTree = "<group>"; };
 		A2000006 /* VAEView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VAEView.swift; sourceTree = "<group>"; };
+		A2000007 /* VideoRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoRunner.swift; sourceTree = "<group>"; };
+		A2000008 /* VideoView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoView.swift; sourceTree = "<group>"; };
 		A2000010 /* SwiftLLMDemo.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SwiftLLMDemo.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -53,6 +57,8 @@
 				A2000003 /* DemoRunner.swift */,
 				A2000005 /* VAERunner.swift */,
 				A2000006 /* VAEView.swift */,
+				A2000007 /* VideoRunner.swift */,
+				A2000008 /* VideoView.swift */,
 				A2000004 /* Info.plist */,
 			);
 			path = SwiftLLMDemo;
@@ -129,6 +135,8 @@
 				A1000003 /* DemoRunner.swift in Sources */,
 				A1000004 /* VAERunner.swift in Sources */,
 				A1000005 /* VAEView.swift in Sources */,
+				A1000006 /* VideoRunner.swift in Sources */,
+				A1000007 /* VideoView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

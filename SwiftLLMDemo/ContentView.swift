@@ -157,9 +157,7 @@ struct ContentView: View {
                                     }
                                     .buttonStyle(.plain)
                                 }
-                                Text(runner.debugLog)
-                                    .font(.system(size: 10, weight: .regular, design: .monospaced))
-                                    .foregroundStyle(.yellow.opacity(0.8))
+                                SelectableText(runner.debugLog)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                             }
                             .padding(10)

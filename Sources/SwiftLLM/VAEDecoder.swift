@@ -18,12 +18,12 @@ import Foundation
 
 // MARK: - Weight containers
 
-struct Conv3DWeight {
-    let weight: Tensor  // [C_out, C_in, kD, kH, kW] f16
-    let bias: Tensor    // [C_out] f16
-    let C_in: Int, C_out: Int
-    let kD: Int, kH: Int, kW: Int
-    let sD: Int, sH: Int, sW: Int
+public struct Conv3DWeight {
+    public let weight: Tensor  // [C_out, C_in, kD, kH, kW] f16
+    public let bias: Tensor    // [C_out] f16
+    public let C_in: Int, C_out: Int
+    public let kD: Int, kH: Int, kW: Int
+    public let sD: Int, sH: Int, sW: Int
 }
 
 struct TimestepEmbedderWeights {
@@ -70,6 +70,8 @@ public class VAEDecoder {
     // Per-channel latent statistics for denormalization
     let stdOfMeans: Tensor   // [128] f16
     let meanOfMeans: Tensor  // [128] f16
+    let stdOfMeansF32: MTLBuffer   // [128] f32
+    let meanOfMeansF32: MTLBuffer  // [128] f32
 
     public init(file: SafeTensorsFile, prefix: String = "decoder.") throws {
         let ctx = MetalContext.shared
@@ -234,6 +236,119 @@ public class VAEDecoder {
         stdOfMeans = loadStats("std-of-means")
         meanOfMeans = loadStats("mean-of-means")
 
+        // Load f32 versions of stats for full-precision pipeline
+        func loadStatsF32(_ name: String) -> MTLBuffer {
+            let key = statsPrefix + "per_channel_statistics." + name
+            guard let info = file.tensors[key], let ptr = file.pointer(for: key) else {
+                fatalError("Stats not found: \(key)")
+            }
+            let count = info.shape.reduce(1, *)
+            if info.dtype == .float32 {
+                return ctx.device.makeBuffer(bytes: ptr, length: count * 4, options: .storageModeShared)!
+            } else if info.dtype == .float16 {
+                let src = ptr.assumingMemoryBound(to: UInt16.self)
+                let buf = ctx.device.makeBuffer(length: count * 4, options: .storageModeShared)!
+                let dst = buf.contents().assumingMemoryBound(to: Float.self)
+                for i in 0..<count { dst[i] = Float(Float16(bitPattern: src[i])) }
+                return buf
+            }
+            fatalError("Unsupported dtype for f32 stats: \(info.dtype)")
+        }
+        stdOfMeansF32 = loadStatsF32("std-of-means")
+        meanOfMeansF32 = loadStatsF32("mean-of-means")
+
+    }
+
+    /// Normalize latents: out = (latent - mean_of_means) / std_of_means (per-channel).
+    /// Input: [B, 128, F, H, W] f16. Uses channel_scale_bias with precomputed 1/std and -mean/std.
+    public func normalize(_ latent: Tensor) -> Tensor {
+        let B = latent.shape[0], C = latent.shape[1]
+        let F = latent.shape[2], H = latent.shape[3], W = latent.shape[4]
+        let spatial = F * H * W
+        // Compute scale=1/std, bias=-mean/std on CPU
+        let stdPtr = stdOfMeans.buffer.contents().assumingMemoryBound(to: Float16.self)
+        let meanPtr = meanOfMeans.buffer.contents().assumingMemoryBound(to: Float16.self)
+        var scaleData = [Float16](repeating: 0, count: C)
+        var biasData = [Float16](repeating: 0, count: C)
+        for c in 0..<C {
+            let s = Float(stdPtr[c])
+            let m = Float(meanPtr[c])
+            let invS = s != 0 ? 1.0 / s : 0.0
+            scaleData[c] = Float16(invS)
+            biasData[c] = Float16(-m * invS)
+        }
+        let ctx = MetalContext.shared
+        let scaleBuf = scaleData.withUnsafeBytes { ctx.device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)! }
+        let biasBuf = biasData.withUnsafeBytes { ctx.device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)! }
+        let out = Tensor.empty(latent.shape, dtype: .float16)
+        let pipe = KernelCache.shared.pipeline("channel_scale_bias")
+        var cU = UInt32(C), sU = UInt32(spatial)
+        ctx.run { enc in
+            enc.setComputePipelineState(pipe)
+            enc.setBuffer(latent.buffer, offset: 0, index: 0)
+            enc.setBuffer(scaleBuf, offset: 0, index: 1)
+            enc.setBuffer(biasBuf, offset: 0, index: 2)
+            enc.setBuffer(out.buffer, offset: 0, index: 3)
+            enc.setBytes(&cU, length: 4, index: 4)
+            enc.setBytes(&sU, length: 4, index: 5)
+            enc.dispatchThreads(MTLSize(width: B * C * spatial, height: 1, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        }
+        return out
+    }
+
+    /// Denormalize latents: out = latent * std_of_means + mean_of_means (per-channel).
+    /// Input: [B, 128, F, H, W] f16. Stats are broadcast over spatial dims.
+    public func denormalize(_ latent: Tensor) -> Tensor {
+        // stdOfMeans/meanOfMeans are [128] f16
+        // Broadcast: [1, 128, 1, 1, 1] over [B, C, F, H, W]
+        let B = latent.shape[0], C = latent.shape[1]
+        let F = latent.shape[2], H = latent.shape[3], W = latent.shape[4]
+        let spatial = F * H * W
+        let out = Tensor.empty(latent.shape, dtype: .float16)
+        let pipe = KernelCache.shared.pipeline("channel_scale_bias")
+        var cU = UInt32(C), sU = UInt32(spatial)
+        MetalContext.shared.run { enc in
+            enc.setComputePipelineState(pipe)
+            enc.setBuffer(latent.buffer, offset: 0, index: 0)
+            enc.setBuffer(stdOfMeans.buffer, offset: 0, index: 1)
+            enc.setBuffer(meanOfMeans.buffer, offset: 0, index: 2)
+            enc.setBuffer(out.buffer, offset: 0, index: 3)
+            enc.setBytes(&cU, length: 4, index: 4)
+            enc.setBytes(&sU, length: 4, index: 5)
+            enc.dispatchThreads(MTLSize(width: B * C * spatial, height: 1, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        }
+        return out
+    }
+
+    /// Denormalize latents f32: out = latent * std + mean (per-channel). All f32.
+    public func denormalizeF32(_ buf: MTLBuffer, B: Int, C: Int, F: Int, H: Int, W: Int) -> MTLBuffer {
+        let spatial = F * H * W
+        return channelScaleBiasF32(x: buf, scale: stdOfMeansF32, bias: meanOfMeansF32,
+                                    B: B, C: C, spatial: spatial)
+    }
+
+    /// Normalize latents f32: out = (latent - mean) / std (per-channel). All f32.
+    public func normalizeF32(_ buf: MTLBuffer, B: Int, C: Int, F: Int, H: Int, W: Int) -> MTLBuffer {
+        let spatial = F * H * W
+        // Compute scale=1/std, bias=-mean/std on CPU from f32 stats
+        let stdPtr = stdOfMeansF32.contents().assumingMemoryBound(to: Float.self)
+        let meanPtr = meanOfMeansF32.contents().assumingMemoryBound(to: Float.self)
+        var scaleData = [Float](repeating: 0, count: C)
+        var biasData = [Float](repeating: 0, count: C)
+        for c in 0..<C {
+            let s = stdPtr[c]
+            let m = meanPtr[c]
+            let invS = s != 0 ? 1.0 / s : 0.0
+            scaleData[c] = invS
+            biasData[c] = -m * invS
+        }
+        let ctx = MetalContext.shared
+        let scaleBuf = scaleData.withUnsafeBytes { ctx.device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)! }
+        let biasBuf = biasData.withUnsafeBytes { ctx.device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)! }
+        return channelScaleBiasF32(x: buf, scale: scaleBuf, bias: biasBuf,
+                                    B: B, C: C, spatial: spatial)
     }
 
     // MARK: - Decode
