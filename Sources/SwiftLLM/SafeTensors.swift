@@ -211,6 +211,36 @@ private func _posixRead(fd: Int32, offset: Int, dst: UnsafeMutableRawPointer, co
     }
 }
 
+/// Write a single tensor to safetensors format.
+public func saveSafetensors(name: String, data: UnsafeRawPointer, byteCount: Int,
+                            dtype: TensorDType, shape: [Int], to url: URL) throws {
+    // Build JSON header
+    let shapeStr = "[" + shape.map { String($0) }.joined(separator: ",") + "]"
+    let header = "{\"\(name)\":{\"dtype\":\"\(dtype.rawValue)\",\"shape\":\(shapeStr),\"data_offsets\":[0,\(byteCount)]}}"
+    let headerData = header.data(using: .utf8)!
+    // Pad header to 8-byte alignment
+    let paddedLen = (headerData.count + 7) & ~7
+    var out = Data(count: 8 + paddedLen + byteCount)
+    out.withUnsafeMutableBytes { ptr in
+        // 8-byte LE header length
+        ptr.storeBytes(of: UInt64(paddedLen), as: UInt64.self)
+        // Header JSON + space padding
+        (ptr.baseAddress! + 8).copyMemory(from: (headerData as NSData).bytes, byteCount: headerData.count)
+        for i in headerData.count..<paddedLen {
+            (ptr.baseAddress! + 8 + i).storeBytes(of: UInt8(0x20), as: UInt8.self) // space padding
+        }
+        // Tensor data
+        (ptr.baseAddress! + 8 + paddedLen).copyMemory(from: data, byteCount: byteCount)
+    }
+    try out.write(to: url)
+}
+
+/// Write a Metal buffer tensor to safetensors.
+public func saveSafetensors(name: String, buffer: MTLBuffer, dtype: TensorDType, shape: [Int], to url: URL) throws {
+    let byteCount = shape.reduce(1, *) * dtype.size
+    try saveSafetensors(name: name, data: buffer.contents(), byteCount: byteCount, dtype: dtype, shape: shape, to: url)
+}
+
 /// Load all safetensors shards from a model directory.
 public func loadSafeTensors(from directory: URL) throws -> [SafeTensorsFile] {
     let fm = FileManager.default

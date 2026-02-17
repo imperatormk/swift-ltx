@@ -1,6 +1,53 @@
 // Metal device + command queue singleton.
 
 import Metal
+import Darwin.Mach
+
+/// Track peak process memory (phys_footprint — what Activity Monitor shows).
+public final class PeakMemoryTracker: @unchecked Sendable {
+    nonisolated(unsafe) public static let shared = PeakMemoryTracker()
+    private var _peak: UInt64 = 0
+    private let lock = os_unfair_lock_t.allocate(capacity: 1)
+
+    private init() { lock.initialize(to: os_unfair_lock()) }
+
+    /// Current process physical footprint in bytes.
+    public var current: UInt64 {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return 0 }
+        return UInt64(info.phys_footprint)
+    }
+
+    /// Sample current and update peak if higher. Returns (current, peak) in bytes.
+    @discardableResult
+    public func sample() -> (current: UInt64, peak: UInt64) {
+        let c = current
+        os_unfair_lock_lock(lock)
+        if c > _peak { _peak = c }
+        let p = _peak
+        os_unfair_lock_unlock(lock)
+        return (c, p)
+    }
+
+    public var peak: UInt64 {
+        os_unfair_lock_lock(lock)
+        let p = _peak
+        os_unfair_lock_unlock(lock)
+        return p
+    }
+
+    public func reset() {
+        os_unfair_lock_lock(lock)
+        _peak = 0
+        os_unfair_lock_unlock(lock)
+    }
+}
 
 public final class MetalContext: @unchecked Sendable {
     nonisolated(unsafe) public static let shared = MetalContext()

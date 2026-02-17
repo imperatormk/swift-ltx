@@ -5,6 +5,9 @@ struct VideoView: View {
     @StateObject private var runner = VideoRunner()
     @State private var showDebug = true
     @State private var didAutoStart = false
+    @State private var currentFrameIndex = 0
+    @State private var frameTimer: Timer? = nil
+    @State private var isPlaying = false
 
     var body: some View {
         NavigationStack {
@@ -25,6 +28,14 @@ struct VideoView: View {
                                     .foregroundStyle(.white)
                             }
                             Spacer()
+                            VStack(alignment: .trailing, spacing: 2) {
+                                Text("PEAK MEM")
+                                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                    .foregroundStyle(.gray)
+                                Text(runner.peakMemText)
+                                    .font(.system(size: 15, weight: .semibold, design: .monospaced))
+                                    .foregroundStyle(.red)
+                            }
                         }
                         .padding(14)
                         .background(Color.white.opacity(0.06))
@@ -33,7 +44,23 @@ struct VideoView: View {
                         // Paths
                         #if os(macOS)
                         pathField("DiT model dir", text: $runner.ditPath)
-                        pathField("T5 embeddings", text: $runner.embeddingsPath)
+                        Toggle("Use T5 Encoder (custom prompt)", isOn: $runner.useT5Encoder)
+                            .font(.system(size: 13, design: .monospaced))
+                            .foregroundStyle(.white)
+                        if runner.useT5Encoder {
+                            pathField("T5 weights", text: $runner.t5WeightsPath)
+                            pathField("Tokenizer", text: $runner.t5TokenizerPath)
+                            HStack {
+                                Text("Prompt:")
+                                    .font(.system(size: 13, design: .monospaced))
+                                    .foregroundStyle(.gray)
+                                TextField("prompt", text: $runner.customPrompt)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(size: 13, design: .monospaced))
+                            }
+                        } else {
+                            pathField("T5 embeddings", text: $runner.embeddingsPath)
+                        }
                         pathField("VAE weights", text: $runner.vaePath)
                         #endif
 
@@ -121,32 +148,74 @@ struct VideoView: View {
                             .clipShape(RoundedRectangle(cornerRadius: 8))
                         }
 
-                        // Decoded image
-                        if let frame = runner.decodedImage {
+                        // Video playback
+                        if !runner.decodedFrames.isEmpty {
+                            let frames = runner.decodedFrames
+                            let frame = frames[currentFrameIndex % frames.count]
                             VStack(alignment: .leading, spacing: 8) {
-                                Text("OUTPUT — \(frame.width)x\(frame.height)")
-                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                    .foregroundStyle(.green)
+                                HStack {
+                                    Text("OUTPUT — \(frame.width)x\(frame.height) — \(frames.count) frames")
+                                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                        .foregroundStyle(.green)
+                                    Spacer()
+                                    Text("F\(currentFrameIndex % frames.count + 1)/\(frames.count)")
+                                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                        .foregroundStyle(.green.opacity(0.7))
+                                }
 
                                 if let img = videoFrameToImage(frame) {
                                     #if os(macOS)
                                     Image(nsImage: img)
                                         .resizable()
-                                        .interpolation(.none)
+                                        .interpolation(.high)
                                         .aspectRatio(contentMode: .fit)
                                         .clipShape(RoundedRectangle(cornerRadius: 8))
                                     #else
                                     Image(uiImage: img)
                                         .resizable()
-                                        .interpolation(.none)
+                                        .interpolation(.high)
                                         .aspectRatio(contentMode: .fit)
                                         .clipShape(RoundedRectangle(cornerRadius: 8))
                                     #endif
+                                }
+
+                                // Playback controls
+                                HStack(spacing: 16) {
+                                    Button(action: {
+                                        if isPlaying { stopPlayback() } else { startPlayback() }
+                                    }) {
+                                        Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                                            .font(.system(size: 16))
+                                            .foregroundStyle(.green)
+                                    }
+                                    .buttonStyle(.plain)
+
+                                    // Frame scrubber
+                                    Slider(value: Binding(
+                                        get: { Double(currentFrameIndex % frames.count) },
+                                        set: { currentFrameIndex = Int($0) }
+                                    ), in: 0...Double(frames.count - 1), step: 1)
+                                    .tint(.green)
+
+                                    // FPS label
+                                    Text("24fps")
+                                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                        .foregroundStyle(.gray)
+
+                                    // Export MP4
+                                    Button(action: { exportMP4(frames: frames) }) {
+                                        Image(systemName: "square.and.arrow.up")
+                                            .font(.system(size: 14))
+                                            .foregroundStyle(.green)
+                                    }
+                                    .buttonStyle(.plain)
                                 }
                             }
                             .padding(12)
                             .background(Color.white.opacity(0.04))
                             .clipShape(RoundedRectangle(cornerRadius: 8))
+                            .onAppear { startPlayback() }
+                            .onDisappear { stopPlayback() }
                         }
 
                         Spacer(minLength: 20)
@@ -196,10 +265,10 @@ struct VideoView: View {
             #endif
             .onAppear {
                 #if os(macOS)
-                if !didAutoStart {
-                    didAutoStart = true
-                    runner.generate()
-                }
+                // if !didAutoStart {
+                //     didAutoStart = true
+                //     runner.generate()
+                // }
                 #endif
             }
         }
@@ -228,6 +297,101 @@ struct VideoView: View {
             .textFieldStyle(.roundedBorder)
             .font(.system(size: 12, design: .monospaced))
             .disabled(runner.isRunning)
+        }
+    }
+
+    private func startPlayback() {
+        guard runner.decodedFrames.count > 1 else { return }
+        stopPlayback()
+        isPlaying = true
+        frameTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 24.0, repeats: true) { _ in
+            DispatchQueue.main.async {
+                currentFrameIndex = (currentFrameIndex + 1) % runner.decodedFrames.count
+            }
+        }
+    }
+
+    private func stopPlayback() {
+        frameTimer?.invalidate()
+        frameTimer = nil
+        isPlaying = false
+    }
+
+    private func exportMP4(frames: [DecodedFrame]) {
+        guard let first = frames.first, first.width > 0, first.height > 0 else { return }
+        #if os(macOS)
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.mpeg4Movie]
+        panel.nameFieldStringValue = "output.mp4"
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            writeMP4(frames: frames, to: url, fps: 24)
+        }
+        #endif
+    }
+}
+
+// MARK: - MP4 Export
+
+import AVFoundation
+
+private func writeMP4(frames: [DecodedFrame], to url: URL, fps: Int) {
+    guard let first = frames.first else { return }
+    let w = first.width, h = first.height
+
+    try? FileManager.default.removeItem(at: url)
+    guard let writer = try? AVAssetWriter(outputURL: url, fileType: .mp4) else { return }
+
+    let settings: [String: Any] = [
+        AVVideoCodecKey: AVVideoCodecType.h264,
+        AVVideoWidthKey: w,
+        AVVideoHeightKey: h
+    ]
+    let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+    let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+        assetWriterInput: input, sourcePixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: w,
+            kCVPixelBufferHeightKey as String: h
+        ])
+    input.expectsMediaDataInRealTime = false
+    writer.add(input)
+    writer.startWriting()
+    writer.startSession(atSourceTime: .zero)
+
+    for (i, frame) in frames.enumerated() {
+        while !input.isReadyForMoreMediaData { Thread.sleep(forTimeInterval: 0.01) }
+        var pixelBuffer: CVPixelBuffer?
+        CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA, nil, &pixelBuffer)
+        guard let pb = pixelBuffer else { continue }
+        CVPixelBufferLockBaseAddress(pb, [])
+        let dst = CVPixelBufferGetBaseAddress(pb)!.assumingMemoryBound(to: UInt8.self)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pb)
+        // Convert RGBA → BGRA
+        frame.rgbaData.withUnsafeBytes { src in
+            let s = src.assumingMemoryBound(to: UInt8.self).baseAddress!
+            for y in 0..<h {
+                for x in 0..<w {
+                    let si = (y * w + x) * 4
+                    let di = y * bytesPerRow + x * 4
+                    dst[di + 0] = s[si + 2] // B
+                    dst[di + 1] = s[si + 1] // G
+                    dst[di + 2] = s[si + 0] // R
+                    dst[di + 3] = s[si + 3] // A
+                }
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(pb, [])
+        let time = CMTime(value: Int64(i), timescale: Int32(fps))
+        adaptor.append(pb, withPresentationTime: time)
+    }
+
+    input.markAsFinished()
+    writer.finishWriting {
+        if writer.status == .completed {
+            print("MP4 saved to \(url.path)")
+        } else {
+            print("MP4 export failed: \(writer.error?.localizedDescription ?? "unknown")")
         }
     }
 }

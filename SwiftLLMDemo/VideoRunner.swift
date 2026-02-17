@@ -2,12 +2,28 @@ import Foundation
 import Metal
 import SwiftLLM
 
+private func debugF32Stats(_ label: String, _ buf: MTLBuffer, count: Int) -> String {
+    let ptr = buf.contents().assumingMemoryBound(to: Float.self)
+    var mn: Float = .infinity, mx: Float = -.infinity, sum: Float = 0, nanCount = 0, infCount = 0
+    for i in 0..<count {
+        let v = ptr[i]
+        if v.isNaN { nanCount += 1; continue }
+        if v.isInfinite { infCount += 1 }
+        if v < mn { mn = v }
+        if v > mx { mx = v }
+        sum += v
+    }
+    return String(format: "[DEBUG] %@: min=%.4g max=%.4g mean=%.4g nan=%d inf=%d (n=%d)",
+                  label, mn, mx, sum / Float(count - nanCount), nanCount, infCount, count)
+}
+
 @MainActor
 final class VideoRunner: ObservableObject {
     @Published var isRunning = false
     @Published var statusText = "Ready"
     @Published var debugLog = ""
-    @Published var decodedImage: DecodedFrame?
+    @Published var decodedImage: DecodedFrame?  // legacy single frame
+    @Published var decodedFrames: [DecodedFrame] = []
     @Published var progress: (Int, Int)? = nil
 
     #if os(macOS)
@@ -15,12 +31,21 @@ final class VideoRunner: ObservableObject {
     @Published var embeddingsPath = NSString(string: "~/Downloads/t5_embed_a_cat_walking_on_a_sunny_beach.safetensors").expandingTildeInPath
     @Published var vaePath = NSString(string: "~/Downloads/ltxv_vae_decoder_f16.safetensors").expandingTildeInPath
     @Published var upsamplerPath = NSString(string: "~/Downloads/ltxv-spatial-upscaler-0.9.8.safetensors").expandingTildeInPath
+    @Published var t5WeightsPath = NSString(string: "~/Downloads/t5_v1_1_xxl_encoder_4bit_v2.safetensors").expandingTildeInPath
+    @Published var t5TokenizerPath = NSString(string: "~/.cache/huggingface/hub/models--google-t5--t5-base/snapshots/a9723ea7f1b39c1eae772870f3b547bf6ef7e6c1/tokenizer.json").expandingTildeInPath
     #else
     @Published var ditPath = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true)[0] + "/ltxv_dit_bf16.safetensors"
     @Published var embeddingsPath = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true)[0] + "/t5_embed_a_cat_walking_on_a_sunny_beach.safetensors"
     @Published var vaePath = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true)[0] + "/ltxv_vae_decoder_f16.safetensors"
     @Published var upsamplerPath = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true)[0] + "/ltxv-spatial-upscaler-0.9.8.safetensors"
+    @Published var t5WeightsPath = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true)[0] + "/t5_v1_1_xxl_encoder_4bit_v2.safetensors"
+    @Published var t5TokenizerPath = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true)[0] + "/tokenizer.json"
     #endif
+
+    @Published var useT5Encoder = true
+    @Published var customPrompt = "young woman"
+
+    @Published var peakMemText: String = "—"
 
     @Published var numFrames: Int = 2
     @Published var height: Int = 24
@@ -42,8 +67,8 @@ final class VideoRunner: ObservableObject {
         return pipeline
     }
 
-    /// Load VAE decoder on demand.
-    nonisolated private func loadVAEDecoder(vaePath: String, log: ((String) -> Void)? = nil) throws -> VAEDecoder {
+    /// Load VAE decoder on demand. Pass pre-loaded stats to avoid re-loading them.
+    nonisolated private func loadVAEDecoder(vaePath: String, stats: VAELatentStats? = nil, log: ((String) -> Void)? = nil) throws -> VAEDecoder {
         let start = CFAbsoluteTimeGetCurrent()
         let vaeURL = URL(fileURLWithPath: vaePath)
         let vaeFile = try SafeTensorsFile(url: vaeURL)
@@ -55,7 +80,7 @@ final class VideoRunner: ObservableObject {
         } else {
             throw VideoRunnerError.noDecoderKeys
         }
-        let vae = try VAEDecoder(file: vaeFile, prefix: prefix)
+        let vae = try VAEDecoder(file: vaeFile, prefix: prefix, stats: stats)
         let elapsed = CFAbsoluteTimeGetCurrent() - start
         log?(String(format: "VAE loaded in %.1fs", elapsed))
         return vae
@@ -71,6 +96,7 @@ final class VideoRunner: ObservableObject {
         statusText = "Generating..."
         debugLog = ""
         decodedImage = nil
+        decodedFrames = []
         progress = nil
 
         let nFrames = numFrames
@@ -80,6 +106,10 @@ final class VideoRunner: ObservableObject {
         let upPath = upsamplerPath
         let ditPth = ditPath
         let vaePth = vaePath
+        let useT5 = useT5Encoder
+        let t5Weights = t5WeightsPath
+        let t5Tok = t5TokenizerPath
+        let prompt = customPrompt
 
         // Distilled model timesteps (from LTX-Video config)
         let pass1Timesteps: [Float] = [1.0, 0.9937, 0.9875, 0.9812, 0.9750, 0.9094, 0.7250]
@@ -92,50 +122,93 @@ final class VideoRunner: ObservableObject {
                 let start = CFAbsoluteTimeGetCurrent()
 
                 func updateLog(_ msg: String, mem: Bool = false) {
-                    guard mem || msg.contains("[MEM]") else { return }
+                    guard msg.contains("[PERF]") || msg.contains("[DEBUG]") else { return }
                     log += msg + "\n"
                     let snap = log
-                    DispatchQueue.main.async { [weak self] in self?.debugLog = snap }
+                    let (_, peak) = PeakMemoryTracker.shared.sample()
+                    let peakStr = String(format: "%dMB", peak / 1048576)
+                    DispatchQueue.main.async { [weak self] in
+                        self?.debugLog = snap
+                        self?.peakMemText = peakStr
+                    }
                 }
 
                 func updateStatus(_ msg: String) {
                     DispatchQueue.main.async { [weak self] in self?.statusText = msg }
                 }
 
-                // Load T5 embeddings
-                let embURL = URL(fileURLWithPath: embPath)
-                let (textEmbFull, textMask) = try loadTextEmbeddings(from: embURL)
-                // Truncate to real tokens using attention mask (skip padding)
-                let fullSeqLen = textEmbFull.shape[1]
-                let realTokens: Int
-                if let textMask {
-                    // Count real tokens (mask values > 0.5) — mask may be f32 or f16
-                    var count = 0
-                    if textMask.dtype == .float32 {
-                        let maskPtr = textMask.buffer.contents().assumingMemoryBound(to: Float.self)
-                        for i in 0..<(textMask.count) { if maskPtr[i] > 0.5 { count += 1 } }
-                    } else {
-                        let maskPtr = textMask.buffer.contents().assumingMemoryBound(to: Float16.self)
-                        for i in 0..<(textMask.count) { if Float(maskPtr[i]) > 0.5 { count += 1 } }
-                    }
-                    realTokens = count
-                } else {
-                    realTokens = fullSeqLen
-                }
-                let textSeqLen = realTokens
+                // Load T5 embeddings (either from file or by running T5 encoder)
+                var pt = CFAbsoluteTimeGetCurrent()
                 let textEmb: Tensor
-                if realTokens < fullSeqLen {
-                    // Truncate: copy first realTokens from [1, fullSeqLen, 4096] → [1, realTokens, 4096]
-                    let dim = textEmbFull.shape[2]
-                    let bytes = realTokens * dim * 4  // f32
+                let textSeqLen: Int
+
+                if useT5 {
+                    // Run T5-XXL 4-bit encoder
+                    updateStatus("Loading T5 encoder...")
+                    let tokenizer = try T5Tokenizer(url: URL(fileURLWithPath: t5Tok))
+                    let tokenIds = tokenizer.encode(prompt)
+                    updateLog(String(format: "[PERF] t5_tokenize: %d tokens", tokenIds.count))
+
+                    updateStatus("Running T5 encoder (24 layers)...")
+                    let encoder = try T5Encoder(url: URL(fileURLWithPath: t5Weights))
+                    encoder.log = { msg in updateLog("[PERF] \(msg)") }
+                    let maxLen = 128
+                    let embBuf = encoder.encode(tokenIds: tokenIds, maxLength: maxLen)
+
+                    // Trim to real tokens (before padding)
+                    let realTokens = min(tokenIds.count, maxLen)
+                    textSeqLen = realTokens
+                    let dim = 4096
+                    let bytes = realTokens * dim * 4
                     let buf = MetalContext.shared.device.makeBuffer(length: bytes, options: .storageModeShared)!
-                    memcpy(buf.contents(), textEmbFull.buffer.contents(), bytes)
+                    memcpy(buf.contents(), embBuf.contents(), bytes)
                     textEmb = Tensor(buffer: buf, shape: [1, realTokens, dim], dtype: .float32)
-                    updateLog("T5 embeddings: \(textEmbFull.shape) → truncated to \(textEmb.shape) (\(realTokens) real tokens)")
+                    updateLog(String(format: "[PERF] t5_encode: %.1fms (seqLen=%d)", (CFAbsoluteTimeGetCurrent() - pt) * 1000, textSeqLen))
                 } else {
-                    textEmb = textEmbFull
-                    updateLog("T5 embeddings: \(textEmb.shape) seqLen=\(textSeqLen)")
+                    // Load pre-computed embeddings
+                    let embURL = URL(fileURLWithPath: embPath)
+                    let (textEmbFull, textMask) = try loadTextEmbeddings(from: embURL)
+                    let fullSeqLen = textEmbFull.shape[1]
+                    let realTokens: Int
+                    if let textMask {
+                        var count = 0
+                        if textMask.dtype == .float32 {
+                            let maskPtr = textMask.buffer.contents().assumingMemoryBound(to: Float.self)
+                            for i in 0..<(textMask.count) { if maskPtr[i] > 0.5 { count += 1 } }
+                        } else {
+                            let maskPtr = textMask.buffer.contents().assumingMemoryBound(to: Float16.self)
+                            for i in 0..<(textMask.count) { if Float(maskPtr[i]) > 0.5 { count += 1 } }
+                        }
+                        realTokens = count
+                    } else {
+                        realTokens = fullSeqLen
+                    }
+                    textSeqLen = realTokens
+                    if realTokens < fullSeqLen {
+                        let dim = textEmbFull.shape[2]
+                        let bytes = realTokens * dim * 4
+                        let buf = MetalContext.shared.device.makeBuffer(length: bytes, options: .storageModeShared)!
+                        memcpy(buf.contents(), textEmbFull.buffer.contents(), bytes)
+                        textEmb = Tensor(buffer: buf, shape: [1, realTokens, dim], dtype: .float32)
+                    } else {
+                        textEmb = textEmbFull
+                    }
+                    updateLog(String(format: "[PERF] t5_embeddings_load: %.1fms (seqLen=%d)", (CFAbsoluteTimeGetCurrent() - pt) * 1000, textSeqLen))
                 }
+
+                // Load VAE latent stats once (~1KB)
+                pt = CFAbsoluteTimeGetCurrent()
+                let vaeFile = try SafeTensorsFile(url: URL(fileURLWithPath: vaePth))
+                let vaePrefix: String
+                if vaeFile.tensors.keys.contains(where: { $0.hasPrefix("decoder.") }) {
+                    vaePrefix = "decoder."
+                } else if vaeFile.tensors.keys.contains(where: { $0.hasPrefix("vae.decoder.") }) {
+                    vaePrefix = "vae.decoder."
+                } else {
+                    throw VideoRunnerError.noDecoderKeys
+                }
+                let latentStats = VAELatentStats.load(file: vaeFile, prefix: vaePrefix)
+                updateLog(String(format: "[PERF] vae_stats_load: %.1fms", (CFAbsoluteTimeGetCurrent() - pt) * 1000))
 
                 // Two-pass: pass1 at ~2/3 target, upsampler 2x, pass2 at full
                 let vaeScaleFactor = 32  // 8x compression × 4 patch
@@ -155,11 +228,13 @@ final class VideoRunner: ObservableObject {
                 let latentC = 128  // config.outChannels
                 let pass1Count = 1 * latentC * nFrames * pass1H * pass1W
                 let pass1F32: MTLBuffer = autoreleasepool {
+                    pt = CFAbsoluteTimeGetCurrent()
                     updateStatus("Loading DiT for Pass 1...")
                     var pipeline: LTXPipeline? = try! self.loadDiTPipeline(ditPath: ditPth) { msg in updateLog(msg) }
+                    updateLog(String(format: "[PERF] S1 dit_load: %.1fms", (CFAbsoluteTimeGetCurrent() - pt) * 1000))
 
                     updateStatus("Pass 1 denoising...")
-                    let ditStart = CFAbsoluteTimeGetCurrent()
+                    pt = CFAbsoluteTimeGetCurrent()
                     let result = pipeline!.generateLatents(
                         textEmbeddings: textEmb,
                         textSeqLen: textSeqLen,
@@ -175,89 +250,73 @@ final class VideoRunner: ObservableObject {
                                 self?.statusText = snap
                             }
                         },
-                        log: { msg in updateLog("  DiT: \(msg)") }
+                        log: { msg in updateLog("  [PERF] P1 \(msg)") }
                     )
-                    let ditTime = CFAbsoluteTimeGetCurrent() - ditStart
-                    updateLog(String(format: "Pass 1 done: %.2fs", ditTime))
+                    updateLog(String(format: "[PERF] S1 pass1_denoise: %.1fms (%d steps)", (CFAbsoluteTimeGetCurrent() - pt) * 1000, pass1Timesteps.count))
                     pipeline = nil
                     return result
                 }
                 let dev = MetalContext.shared.device
-                updateLog(String(format: "S1 after autorelease: Metal=%dMB", dev.currentAllocatedSize/1048576), mem: true)
-                let s1 = MetalContext.shared.bufferPool.stats
-                updateLog(String(format: "S1 end: Metal=%dMB pool(act=%dMB/%d free=%dMB/%d)",
-                    dev.currentAllocatedSize/1048576, s1.active/1048576, s1.activeCount, s1.free/1048576, s1.freeCount), mem: true)
                 MetalContext.shared.bufferPool.releaseAll(keeping: [pass1F32])
-                updateLog(String(format: "S1 released: Metal=%dMB", dev.currentAllocatedSize/1048576), mem: true)
 
-                // === Stage 2: Load VAE + Upsampler → Upsample + AdaIN → Release ALL ===
+                // === Stage 2: Upsampler + AdaIN (no VAE needed — stats already loaded) ===
+                updateLog(debugF32Stats("pass1F32_input", pass1F32, count: pass1Count))
                 let upCount = 1 * latentC * nFrames * finalH * finalW
                 let adainedF32: MTLBuffer = autoreleasepool {
-                    updateStatus("Loading VAE + upsampler...")
-                    let vae2 = try! self.loadVAEDecoder(vaePath: vaePth) { msg in updateLog(msg, mem: true) }
-                    updateLog(String(format: "S2 VAE loaded: Metal=%dMB", dev.currentAllocatedSize/1048576), mem: true)
-
-                    let upStart = CFAbsoluteTimeGetCurrent()
+                    var s2t = CFAbsoluteTimeGetCurrent()
+                    updateStatus("Loading upsampler...")
                     let upWeights = try! loadUpsamplerWeights(from: URL(fileURLWithPath: upPath))
                     let upsampler = LatentUpsampler(weights: upWeights)
-                    updateLog(String(format: "Upsampler loaded in %.1fs, Metal=%dMB", CFAbsoluteTimeGetCurrent() - upStart, dev.currentAllocatedSize/1048576), mem: true)
+                    updateLog(String(format: "[PERF] S2 upsampler_load: %.1fms, Metal=%dMB", (CFAbsoluteTimeGetCurrent() - s2t) * 1000, dev.currentAllocatedSize/1048576), mem: true)
 
                     updateStatus("Upsampling latents (f32)...")
-                    let denormedPass1F32 = vae2.denormalize(pass1F32, B: 1, C: latentC, F: nFrames, H: pass1H, W: pass1W)
+                    s2t = CFAbsoluteTimeGetCurrent()
+                    let denormedPass1F32 = latentStats.denormalize(pass1F32, B: 1, C: latentC, F: nFrames, H: pass1H, W: pass1W)
+                    updateLog(String(format: "[PERF] S2 denormalize: %.1fms", (CFAbsoluteTimeGetCurrent() - s2t) * 1000), mem: true)
+                    updateLog(debugF32Stats("denormed", denormedPass1F32, count: 1 * latentC * nFrames * pass1H * pass1W))
 
+                    s2t = CFAbsoluteTimeGetCurrent()
                     let upsampledF32 = upsampler.forward(denormedPass1F32, B: 1, F: nFrames, H: pass1H, W: pass1W) { msg in
-                        updateLog("  Upsampler: \(msg)")
+                        updateLog("  \(msg)", mem: msg.contains("[PERF]"))
                     }
+                    updateLog(String(format: "[PERF] S2 upsampler_forward: %.1fms", (CFAbsoluteTimeGetCurrent() - s2t) * 1000), mem: true)
+                    updateLog(debugF32Stats("upsampled", upsampledF32, count: upCount))
 
-                    let renormedF32 = vae2.normalize(upsampledF32, B: 1, C: latentC, F: nFrames, H: finalH, W: finalW)
+                    s2t = CFAbsoluteTimeGetCurrent()
+                    let renormedF32 = latentStats.normalize(upsampledF32, B: 1, C: latentC, F: nFrames, H: finalH, W: finalW)
+                    updateLog(String(format: "[PERF] S2 normalize: %.1fms", (CFAbsoluteTimeGetCurrent() - s2t) * 1000), mem: true)
+                    updateLog(debugF32Stats("renormed", renormedF32, count: upCount))
 
+                    s2t = CFAbsoluteTimeGetCurrent()
                     let result = adainFilter(renormedF32, reference: pass1F32,
                                              B: 1, C: latentC,
                                              latShape: [1, latentC, nFrames, finalH, finalW],
                                              refShape: [1, latentC, nFrames, pass1H, pass1W],
                                              factor: 1.0)
+                    updateLog(String(format: "[PERF] S2 adain: %.1fms", (CFAbsoluteTimeGetCurrent() - s2t) * 1000), mem: true)
+                    updateLog(debugF32Stats("adained", result, count: upCount))
                     return result
-                    // vae2 + upsampler freed here
+                    // upsampler freed here
                 }
                 let s2 = MetalContext.shared.bufferPool.stats
                 updateLog(String(format: "S2 end: Metal=%dMB pool(act=%dMB/%d free=%dMB/%d)",
                     dev.currentAllocatedSize/1048576, s2.active/1048576, s2.activeCount, s2.free/1048576, s2.freeCount), mem: true)
                 MetalContext.shared.bufferPool.releaseAll(keeping: [adainedF32])
-                updateLog(String(format: "S2 released: Metal=%dMB", dev.currentAllocatedSize/1048576), mem: true)
 
                 // === Stage 3: Load DiT → Pass 2 → Release DiT ===
-                // Load MLX pass2 noise if available
-                var pass2NoiseOverride: MTLBuffer? = nil
-                #if os(macOS)
-                let pass2NoisePath = NSString(string: "~/projects/oss/swift-llm/fixtures/mlx_pass2_noise.safetensors").expandingTildeInPath
-                #else
-                let pass2NoisePath = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true)[0] + "/mlx_pass2_noise.safetensors"
-                #endif
-                let pass2NoiseURL = URL(fileURLWithPath: pass2NoisePath)
-                if FileManager.default.fileExists(atPath: pass2NoiseURL.path) {
-                    let nf = try SafeTensorsFile(url: pass2NoiseURL)
-                    let nk = nf.tensors.keys.first!
-                    let ni = nf.tensors[nk]!
-                    let np = nf.pointer(for: nk)!
-                    let nc = ni.shape.reduce(1, *)
-                    if ni.dtype == .float32 {
-                        pass2NoiseOverride = MetalContext.shared.device.makeBuffer(bytes: np, length: nc * 4, options: .storageModeShared)!
-                    } else {
-                        let src = np.assumingMemoryBound(to: Float16.self)
-                        pass2NoiseOverride = MetalContext.shared.device.makeBuffer(length: nc * 4, options: .storageModeShared)!
-                        let dst = pass2NoiseOverride!.contents().assumingMemoryBound(to: Float.self)
-                        for i in 0..<nc { dst[i] = Float(src[i]) }
-                    }
-                    updateLog("Loaded MLX pass2 noise: \(f32Stats(pass2NoiseOverride!, count: nc))")
-                }
+                pt = CFAbsoluteTimeGetCurrent()
+                let pass2NoiseOverride: MTLBuffer? = nil  // Generate fresh noise (MLX noise has wrong shape for Pass 2)
+                updateLog(String(format: "[PERF] S3 noise_load: %.1fms", (CFAbsoluteTimeGetCurrent() - pt) * 1000))
 
                 let pass2Count = 1 * latentC * nFrames * finalH * finalW
                 let pass2F32: MTLBuffer = autoreleasepool {
+                    pt = CFAbsoluteTimeGetCurrent()
                     updateStatus("Loading DiT for Pass 2...")
                     var pipeline2: LTXPipeline? = try! self.loadDiTPipeline(ditPath: ditPth) { msg in updateLog(msg) }
+                    updateLog(String(format: "[PERF] S3 dit_load: %.1fms", (CFAbsoluteTimeGetCurrent() - pt) * 1000))
 
                     updateStatus("Pass 2 denoising...")
-                    let pass2Start = CFAbsoluteTimeGetCurrent()
+                    pt = CFAbsoluteTimeGetCurrent()
                     let result = pipeline2!.denoiseLatents(
                         inputLatentsF32: adainedF32,
                         B: 1, C: latentC, numFrames: nFrames, height: finalH, width: finalW,
@@ -273,39 +332,47 @@ final class VideoRunner: ObservableObject {
                                 self?.statusText = snap
                             }
                         },
-                        log: { msg in updateLog("  DiT: \(msg)") }
+                        log: { msg in updateLog("  [PERF] P2 \(msg)") }
                     )
-                    let pass2Time = CFAbsoluteTimeGetCurrent() - pass2Start
-                    updateLog(String(format: "Pass 2 done: %.2fs", pass2Time))
+                    updateLog(String(format: "[PERF] S3 pass2_denoise: %.1fms (%d steps)", (CFAbsoluteTimeGetCurrent() - pt) * 1000, pass2Timesteps.count))
                     pipeline2 = nil
                     return result
                 }
-                let s3 = MetalContext.shared.bufferPool.stats
-                updateLog(String(format: "S3 end: Metal=%dMB pool(act=%dMB/%d free=%dMB/%d)",
-                    dev.currentAllocatedSize/1048576, s3.active/1048576, s3.activeCount, s3.free/1048576, s3.freeCount), mem: true)
                 MetalContext.shared.bufferPool.releaseAll(keeping: [pass2F32])
-                updateLog(String(format: "S3 released: Metal=%dMB", dev.currentAllocatedSize/1048576), mem: true)
 
                 // === Stage 4: Load VAE → decode ===
+                pt = CFAbsoluteTimeGetCurrent()
                 updateStatus("Loading VAE for decode...")
-                let vaeDecoder = try self.loadVAEDecoder(vaePath: vaePth) { msg in updateLog(msg, mem: true) }
-                updateLog(String(format: "S4 VAE loaded: Metal=%dMB", dev.currentAllocatedSize/1048576), mem: true)
+                let vaeDecoder = try self.loadVAEDecoder(vaePath: vaePth, stats: latentStats) { msg in updateLog(msg) }
+                updateLog(String(format: "[PERF] S4 vae_load: %.1fms", (CFAbsoluteTimeGetCurrent() - pt) * 1000))
 
+                pt = CFAbsoluteTimeGetCurrent()
                 let finalF16 = castF32toF16(pass2F32, count: pass2Count, shape: [1, latentC, nFrames, finalH, finalW])
-                let denormed = vaeDecoder.denormalize(finalF16)
-                updateLog("Denormalized: \(f16Stats(denormed))")
+                updateLog(String(format: "[PERF] S4 cast_f32_to_f16: %.1fms", (CFAbsoluteTimeGetCurrent() - pt) * 1000))
 
+                // Save latents for quick VAE iteration
+                let latentSavePath = "/tmp/ltxv_pipeline_latents.safetensors"
+                let latentSavePathVAETab = "/tmp/mlx_vae_input_latents.safetensors"
+                try saveSafetensors(name: "latent", buffer: finalF16.buffer, dtype: .float16,
+                                    shape: finalF16.shape, to: URL(fileURLWithPath: latentSavePath))
+                try saveSafetensors(name: "latent", buffer: finalF16.buffer, dtype: .float16,
+                                    shape: finalF16.shape, to: URL(fileURLWithPath: latentSavePathVAETab))
+                updateLog("[SAVE] Latents saved to \(latentSavePath) + VAE tab path, shape=\(finalF16.shape)")
+
+                pt = CFAbsoluteTimeGetCurrent()
+                let denormed = vaeDecoder.denormalize(finalF16)
+                updateLog(String(format: "[PERF] S4 denormalize: %.1fms", (CFAbsoluteTimeGetCurrent() - pt) * 1000))
+
+                pt = CFAbsoluteTimeGetCurrent()
                 let noised = mixDecodeNoise(denormed, noiseScale: 0.025, seed: 0)
-                updateLog("After decode noise: \(f16Stats(noised))")
+                updateLog(String(format: "[PERF] S4 decode_noise: %.1fms", (CFAbsoluteTimeGetCurrent() - pt) * 1000))
 
                 updateStatus("VAE decoding...")
-                let vaeStart = CFAbsoluteTimeGetCurrent()
+                pt = CFAbsoluteTimeGetCurrent()
                 let output = vaeDecoder.decode(noised) { msg in
-                    updateLog("  VAE: \(msg)")
+                    updateLog("  [PERF] VAE \(msg)")
                 }
-                let vaeTime = CFAbsoluteTimeGetCurrent() - vaeStart
-                updateLog(String(format: "VAE decode: %.2fs", vaeTime))
-                updateLog("Output: \(output.shape)")
+                updateLog(String(format: "[PERF] S4 vae_decode: %.1fms", (CFAbsoluteTimeGetCurrent() - pt) * 1000))
 
                 guard output.shape.count == 5 else {
                     updateLog("ERROR: expected 5D output, got \(output.shape)")
@@ -329,17 +396,18 @@ final class VideoRunner: ObservableObject {
                     return
                 }
 
-                let frame = extractFirstFrame(from: output)
-                updateLog("Frame: \(frame.width)x\(frame.height)")
+                let frames = extractAllFrames(from: output, targetWidth: targetPixW, targetHeight: targetPixH)
+                updateLog("\(frames.count) frames: \(frames.first?.width ?? 0)x\(frames.first?.height ?? 0)")
 
                 let totalTime = CFAbsoluteTimeGetCurrent() - start
-                updateLog(String(format: "Total: %.2fs", totalTime))
+                updateLog(String(format: "[PERF] TOTAL: %.1fms (%.1fs)", totalTime * 1000, totalTime))
 
                 let finalLog = log
                 DispatchQueue.main.async { [weak self] in
-                    self?.decodedImage = frame
+                    self?.decodedFrames = frames
+                    self?.decodedImage = frames.first
                     self?.debugLog = finalLog
-                    self?.statusText = String(format: "Done in %.1fs — %dx%d", totalTime, frame.width, frame.height)
+                    self?.statusText = String(format: "Done in %.1fs — %d frames %dx%d", totalTime, frames.count, frames.first?.width ?? 0, frames.first?.height ?? 0)
                     self?.isRunning = false
                     self?.progress = nil
                 }
@@ -370,7 +438,12 @@ final class VideoRunner: ObservableObject {
             guard let self else { return }
             do {
                 var log = ""
-                func updateLog(_ msg: String) { log += msg + "\n"; let s = log; DispatchQueue.main.async { [weak self] in self?.debugLog = s } }
+                func updateLog(_ msg: String) {
+                    log += msg + "\n"; let s = log
+                    let (_, peak) = PeakMemoryTracker.shared.sample()
+                    let peakStr = String(format: "%dMB", peak / 1048576)
+                    DispatchQueue.main.async { [weak self] in self?.debugLog = s; self?.peakMemText = peakStr }
+                }
                 func updateStatus(_ msg: String) { DispatchQueue.main.async { [weak self] in self?.statusText = msg } }
 
                 // Load MLX AdaIN latents
@@ -421,43 +494,15 @@ final class VideoRunner: ObservableObject {
                     textEmb = Tensor(buffer: buf, shape: [1, realTokens, dim], dtype: .float32)
                 } else { textEmb = textEmbFull }
 
-                // Load MLX pass2 noise if available
-                var noiseOverride: MTLBuffer? = nil
-                #if os(macOS)
-                let noiseURLPath = NSString(string: "~/projects/oss/swift-llm/fixtures/mlx_pass2_noise.safetensors").expandingTildeInPath
-                #else
-                let noiseURLPath = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true)[0] + "/mlx_pass2_noise.safetensors"
-                #endif
-                let noiseURL = URL(fileURLWithPath: noiseURLPath)
-                if FileManager.default.fileExists(atPath: noiseURL.path) {
-                    let noiseFile = try SafeTensorsFile(url: noiseURL)
-                    let noiseKey = noiseFile.tensors.keys.first!
-                    let noiseInfo = noiseFile.tensors[noiseKey]!
-                    let noisePtr = noiseFile.pointer(for: noiseKey)!
-                    let noiseCount = noiseInfo.shape.reduce(1, *)
-                    if noiseInfo.dtype == .float32 {
-                        noiseOverride = MetalContext.shared.device.makeBuffer(bytes: noisePtr, length: noiseCount * 4, options: .storageModeShared)!
-                    } else {
-                        let src = noisePtr.assumingMemoryBound(to: Float16.self)
-                        noiseOverride = MetalContext.shared.device.makeBuffer(length: noiseCount * 4, options: .storageModeShared)!
-                        let dst = noiseOverride!.contents().assumingMemoryBound(to: Float.self)
-                        for i in 0..<noiseCount { dst[i] = Float(src[i]) }
-                    }
-                    updateLog("Loaded MLX pass2 noise: \(noiseInfo.shape) → \(f32Stats(noiseOverride!, count: noiseCount))")
-                } else {
-                    updateLog("No MLX noise file, using srand48 noise")
-                }
-
                 // Pass 2 — load DiT on demand
                 updateStatus("Loading DiT for Pass 2...")
                 let pipeline = try self.loadDiTPipeline(ditPath: ditPth) { msg in updateLog(msg) }
-                updateStatus("Pass 2 denoising (MLX input)...")
+                updateStatus("Pass 2 denoising...")
                 let pass2F32 = pipeline.denoiseLatents(
                     inputLatentsF32: adainF32,
                     B: B, C: latentC, numFrames: nFrames, height: finalH, width: finalW,
                     textEmbeddings: textEmb, textSeqLen: realTokens,
                     timesteps: pass2Timesteps, seed: 42,
-                    noiseOverrideF32: noiseOverride,
                     progressHandler: { step, total in
                         DispatchQueue.main.async { [weak self] in self?.progress = (step, total); self?.statusText = "Pass 2 step \(step)/\(total)" }
                     },

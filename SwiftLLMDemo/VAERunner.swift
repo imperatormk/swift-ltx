@@ -1,5 +1,6 @@
 import Foundation
 import Metal
+import CoreGraphics
 import SwiftLLM
 
 @MainActor
@@ -271,6 +272,77 @@ func extractFirstFrame(from tensor: Tensor) -> DecodedFrame {
         }
     }
     return DecodedFrame(width: W, height: H, rgbaData: rgba)
+}
+
+/// Extract ALL frames from a [B, 3, F, H, W] f16 tensor → [DecodedFrame].
+func extractAllFrames(from tensor: Tensor, targetWidth: Int? = nil, targetHeight: Int? = nil) -> [DecodedFrame] {
+    let shape = tensor.shape
+    guard shape.count >= 5 else { return [extractFirstFrame(from: tensor)] }
+    let C = shape[1], F = shape[2], H = shape[3], W = shape[4]
+    let totalElements = shape.reduce(1, *)
+    let bufferElements = tensor.buffer.length / 2
+    guard bufferElements >= totalElements else { return [extractFirstFrame(from: tensor)] }
+
+    let ptr = tensor.buffer.contents().assumingMemoryBound(to: UInt16.self)
+    let chanStride = F * H * W
+    let frameStride = H * W
+
+    let tW = targetWidth ?? W
+    let tH = targetHeight ?? H
+    let needsResize = (tW != W || tH != H)
+
+    var frames = [DecodedFrame]()
+    for f in 0..<F {
+        var rgba = Data(count: H * W * 4)
+        rgba.withUnsafeMutableBytes { raw in
+            let dst = raw.assumingMemoryBound(to: UInt8.self).baseAddress!
+            for y in 0..<H {
+                for x in 0..<W {
+                    let spatialIdx = y * W + x
+                    for c in 0..<min(C, 3) {
+                        let srcIdx = c * chanStride + f * frameStride + spatialIdx
+                        let val = Float(Float16(bitPattern: ptr[srcIdx]))
+                        let mapped = val / 2.0 + 0.5
+                        let clamped = mapped.isNaN ? Float(0) : min(max(mapped, 0), 1)
+                        dst[spatialIdx * 4 + c] = UInt8(clamped * 255)
+                    }
+                    dst[spatialIdx * 4 + 3] = 255
+                }
+            }
+        }
+
+        if needsResize {
+            // Bilinear resize using CoreGraphics (matches Python F.interpolate bilinear)
+            let resized = bilinearResize(rgba, srcW: W, srcH: H, dstW: tW, dstH: tH)
+            frames.append(DecodedFrame(width: tW, height: tH, rgbaData: resized))
+        } else {
+            frames.append(DecodedFrame(width: W, height: H, rgbaData: rgba))
+        }
+    }
+    return frames
+}
+
+/// Bilinear resize RGBA8 data using CoreGraphics.
+private func bilinearResize(_ data: Data, srcW: Int, srcH: Int, dstW: Int, dstH: Int) -> Data {
+    guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else { return data }
+    var mutData = data
+    guard let srcCtx = mutData.withUnsafeMutableBytes({ raw -> CGContext? in
+        CGContext(data: raw.baseAddress, width: srcW, height: srcH,
+                  bitsPerComponent: 8, bytesPerRow: srcW * 4,
+                  space: colorSpace,
+                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+    }), let srcImage = srcCtx.makeImage() else { return data }
+
+    var dstData = Data(count: dstW * dstH * 4)
+    dstData.withUnsafeMutableBytes { raw in
+        guard let dstCtx = CGContext(data: raw.baseAddress, width: dstW, height: dstH,
+                                     bitsPerComponent: 8, bytesPerRow: dstW * 4,
+                                     space: colorSpace,
+                                     bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+        dstCtx.interpolationQuality = .high
+        dstCtx.draw(srcImage, in: CGRect(x: 0, y: 0, width: dstW, height: dstH))
+    }
+    return dstData
 }
 
 private func f16ToFloat(_ bits: UInt16) -> Float {

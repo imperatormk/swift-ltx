@@ -54,156 +54,16 @@ struct DepthToSpaceWeights {
     let outChannelsReductionFactor: Int
 }
 
-// MARK: - VAE Decoder Model
+// MARK: - Latent Statistics (lightweight, ~1KB)
 
-public class VAEDecoder {
-    let convIn: Conv3DWeight        // 128 → 1024
-    let upBlocks: [Any]             // mix of UNetMidBlockWeights and DepthToSpaceWeights
-    let convOut: Conv3DWeight       // 128 → 48
-    let patchSize: Int = 4
+/// Per-channel mean/std for latent (de)normalization. Tiny — load once, reuse everywhere.
+public struct VAELatentStats {
+    public let stdOfMeans: Tensor      // [128] f16
+    public let meanOfMeans: Tensor     // [128] f16
+    public let stdOfMeansF32: MTLBuffer   // [128] f32
+    public let meanOfMeansF32: MTLBuffer  // [128] f32
 
-    // Timestep conditioning
-    let timestepScaleMultiplier: Float
-    let lastTimeEmbedder: TimestepEmbedderWeights
-    let lastScaleShiftTable: Tensor  // [2, 128] f16
-
-    // Per-channel latent statistics for denormalization
-    let stdOfMeans: Tensor   // [128] f16
-    let meanOfMeans: Tensor  // [128] f16
-    let stdOfMeansF32: MTLBuffer   // [128] f32
-    let meanOfMeansF32: MTLBuffer  // [128] f32
-
-    public init(file: SafeTensorsFile, prefix: String = "decoder.") throws {
-        let ctx = MetalContext.shared
-
-        // Helper: load f16 tensor into Metal buffer
-        func load(_ name: String) -> Tensor {
-            let key = prefix + name
-            guard let info = file.tensors[key] else {
-                fatalError("Weight not found: \(key)")
-            }
-            let ptr = file.pointer(for: key)!
-            if info.dtype == .float16 {
-                let buf = ctx.device.makeBuffer(bytes: ptr, length: info.byteCount, options: .storageModeShared)!
-                return Tensor(buffer: buf, shape: info.shape, dtype: .float16)
-            } else if info.dtype == .float32 {
-                // Convert f32 → f16
-                let count = info.byteCount / 4
-                let src = ptr.assumingMemoryBound(to: Float.self)
-                let buf = ctx.device.makeBuffer(length: count * 2, options: .storageModeShared)!
-                let dst = buf.contents().assumingMemoryBound(to: UInt16.self)
-                for i in 0..<count {
-                    dst[i] = VAEDecoder.float32ToFloat16(src[i])
-                }
-                return Tensor(buffer: buf, shape: info.shape, dtype: .float16)
-            } else if info.dtype == .bfloat16 {
-                let count = info.byteCount / 2
-                let src = ptr.assumingMemoryBound(to: UInt16.self)
-                let buf = ctx.device.makeBuffer(length: count * 2, options: .storageModeShared)!
-                let dst = buf.contents().assumingMemoryBound(to: UInt16.self)
-                for i in 0..<count {
-                    let f = Float(bitPattern: UInt32(src[i]) << 16)
-                    dst[i] = VAEDecoder.float32ToFloat16(f)
-                }
-                return Tensor(buffer: buf, shape: info.shape, dtype: .float16)
-            }
-            fatalError("Unsupported dtype: \(info.dtype)")
-        }
-
-        func loadFloat(_ name: String) -> Float {
-            let key = prefix + name
-            guard let info = file.tensors[key] else {
-                fatalError("Weight not found: \(key)")
-            }
-            let ptr = file.pointer(for: key)!
-            if info.dtype == .float32 {
-                return ptr.assumingMemoryBound(to: Float.self).pointee
-            } else if info.dtype == .float16 {
-                let h = ptr.assumingMemoryBound(to: UInt16.self).pointee
-                return VAEDecoder.float16ToFloat32(h)
-            }
-            fatalError("Unsupported dtype for scalar: \(info.dtype)")
-        }
-
-        func loadConv(_ p: String, C_in: Int, C_out: Int, sD: Int = 1, sH: Int = 1, sW: Int = 1) -> Conv3DWeight {
-            let w = load("\(p).conv.weight")
-            let b = load("\(p).conv.bias")
-            return Conv3DWeight(weight: w, bias: b, C_in: C_in, C_out: C_out,
-                              kD: 3, kH: 3, kW: 3, sD: sD, sH: sH, sW: sW)
-        }
-
-        func loadTimeEmbedder(_ p: String, outDim: Int) -> TimestepEmbedderWeights {
-            return TimestepEmbedderWeights(
-                linear1Weight: load("\(p).timestep_embedder.linear_1.weight"),
-                linear1Bias: load("\(p).timestep_embedder.linear_1.bias"),
-                linear2Weight: load("\(p).timestep_embedder.linear_2.weight"),
-                linear2Bias: load("\(p).timestep_embedder.linear_2.bias"),
-                outDim: outDim
-            )
-        }
-
-        func loadResBlock(_ p: String, ch: Int) -> ResBlockWeights {
-            return ResBlockWeights(
-                scaleShiftTable: load("\(p).scale_shift_table"),
-                conv1: loadConv("\(p).conv1", C_in: ch, C_out: ch),
-                conv2: loadConv("\(p).conv2", C_in: ch, C_out: ch),
-                channels: ch
-            )
-        }
-
-        // conv_in: [1024, 128, 3, 3, 3]
-        convIn = loadConv("conv_in", C_in: 128, C_out: 1024)
-
-        // up_blocks: 7 blocks alternating UNetMidBlock3D and DepthToSpaceUpsample
-        // Block layout from actual weights:
-        //   0: UNetMidBlock3D(1024, 5 res, te→4096)
-        //   1: DepthToSpace(1024→4096)  → after shuffle: 512ch, 2x spatial
-        //   2: UNetMidBlock3D(512, 5 res, te→2048)
-        //   3: DepthToSpace(512→2048)   → after shuffle: 256ch, 2x spatial
-        //   4: UNetMidBlock3D(256, 5 res, te→1024)
-        //   5: DepthToSpace(256→1024)   → after shuffle: 128ch, 2x spatial
-        //   6: UNetMidBlock3D(128, 5 res, te→512)
-        var blocks: [Any] = []
-
-        let midBlockConfig: [(idx: Int, ch: Int, teDim: Int, numRes: Int)] = [
-            (0, 1024, 4096, 5),
-            (2, 512, 2048, 5),
-            (4, 256, 1024, 5),
-            (6, 128, 512, 5),
-        ]
-
-        let dtsBlockConfig: [(idx: Int, C_in: Int, C_out: Int)] = [
-            (1, 1024, 4096),
-            (3, 512, 2048),
-            (5, 256, 1024),
-        ]
-
-        // Load all 7 blocks in order
-        for i in 0..<7 {
-            if let mid = midBlockConfig.first(where: { $0.idx == i }) {
-                let te = loadTimeEmbedder("up_blocks.\(i).time_embedder", outDim: mid.teDim)
-                var resBlocks: [ResBlockWeights] = []
-                for r in 0..<mid.numRes {
-                    resBlocks.append(loadResBlock("up_blocks.\(i).res_blocks.\(r)", ch: mid.ch))
-                }
-                blocks.append(UNetMidBlockWeights(timeEmbedder: te, resBlocks: resBlocks, channels: mid.ch))
-            } else if let dts = dtsBlockConfig.first(where: { $0.idx == i }) {
-                let conv = loadConv("up_blocks.\(i).conv", C_in: dts.C_in, C_out: dts.C_out)
-                blocks.append(DepthToSpaceWeights(conv: conv, stride: (2,2,2), residual: true, outChannelsReductionFactor: 2))
-            }
-        }
-
-        upBlocks = blocks
-
-        // conv_out: [48, 128, 3, 3, 3]
-        convOut = loadConv("conv_out", C_in: 128, C_out: 48)
-
-        // Timestep conditioning
-        timestepScaleMultiplier = loadFloat("timestep_scale_multiplier")
-        lastTimeEmbedder = loadTimeEmbedder("last_time_embedder", outDim: 256)
-        lastScaleShiftTable = load("last_scale_shift_table")
-
-        // Load per-channel latent statistics (keys use "vae.per_channel_statistics." prefix, not "decoder.")
+    public static func load(file: SafeTensorsFile, prefix: String) -> VAELatentStats {
         let statsPrefix: String
         if prefix == "decoder." {
             statsPrefix = "vae."
@@ -212,11 +72,10 @@ public class VAEDecoder {
         } else {
             statsPrefix = ""
         }
-        func loadStats(_ name: String) -> Tensor {
+        let ctx = MetalContext.shared
+        func loadF16(_ name: String) -> Tensor {
             let key = statsPrefix + "per_channel_statistics." + name
-            guard let info = file.tensors[key] else {
-                fatalError("Stats not found: \(key)")
-            }
+            guard let info = file.tensors[key] else { fatalError("Stats not found: \(key)") }
             let ptr = file.pointer(for: key)!
             if info.dtype == .float16 {
                 let buf = ctx.device.makeBuffer(bytes: ptr, length: info.byteCount, options: .storageModeShared)!
@@ -226,22 +85,14 @@ public class VAEDecoder {
                 let src = ptr.assumingMemoryBound(to: Float.self)
                 let buf = ctx.device.makeBuffer(length: count * 2, options: .storageModeShared)!
                 let dst = buf.contents().assumingMemoryBound(to: UInt16.self)
-                for i in 0..<count {
-                    dst[i] = VAEDecoder.float32ToFloat16(src[i])
-                }
+                for i in 0..<count { dst[i] = VAEDecoder.float32ToFloat16(src[i]) }
                 return Tensor(buffer: buf, shape: info.shape, dtype: .float16)
             }
             fatalError("Unsupported dtype for stats: \(info.dtype)")
         }
-        stdOfMeans = loadStats("std-of-means")
-        meanOfMeans = loadStats("mean-of-means")
-
-        // Load f32 versions of stats for full-precision pipeline
-        func loadStatsF32(_ name: String) -> MTLBuffer {
+        func loadF32(_ name: String) -> MTLBuffer {
             let key = statsPrefix + "per_channel_statistics." + name
-            guard let info = file.tensors[key], let ptr = file.pointer(for: key) else {
-                fatalError("Stats not found: \(key)")
-            }
+            guard let info = file.tensors[key], let ptr = file.pointer(for: key) else { fatalError("Stats not found: \(key)") }
             let count = info.shape.reduce(1, *)
             if info.dtype == .float32 {
                 return ctx.device.makeBuffer(bytes: ptr, length: count * 4, options: .storageModeShared)!
@@ -254,47 +105,22 @@ public class VAEDecoder {
             }
             fatalError("Unsupported dtype for f32 stats: \(info.dtype)")
         }
-        stdOfMeansF32 = loadStatsF32("std-of-means")
-        meanOfMeansF32 = loadStatsF32("mean-of-means")
-
+        return VAELatentStats(
+            stdOfMeans: loadF16("std-of-means"),
+            meanOfMeans: loadF16("mean-of-means"),
+            stdOfMeansF32: loadF32("std-of-means"),
+            meanOfMeansF32: loadF32("mean-of-means")
+        )
     }
 
-    /// Denormalize latents: out = latent * std_of_means + mean_of_means (per-channel).
-    /// Input: [B, 128, F, H, W] f16. Stats are broadcast over spatial dims.
-    public func denormalize(_ latent: Tensor) -> Tensor {
-        // stdOfMeans/meanOfMeans are [128] f16
-        // Broadcast: [1, 128, 1, 1, 1] over [B, C, F, H, W]
-        let B = latent.shape[0], C = latent.shape[1]
-        let F = latent.shape[2], H = latent.shape[3], W = latent.shape[4]
-        let spatial = F * H * W
-        let out = Tensor.empty(latent.shape, dtype: .float16)
-        let pipe = KernelCache.shared.pipeline("channel_scale_bias")
-        var cU = UInt32(C), sU = UInt32(spatial)
-        MetalContext.shared.run { enc in
-            enc.setComputePipelineState(pipe)
-            enc.setBuffer(latent.buffer, offset: 0, index: 0)
-            enc.setBuffer(stdOfMeans.buffer, offset: 0, index: 1)
-            enc.setBuffer(meanOfMeans.buffer, offset: 0, index: 2)
-            enc.setBuffer(out.buffer, offset: 0, index: 3)
-            enc.setBytes(&cU, length: 4, index: 4)
-            enc.setBytes(&sU, length: 4, index: 5)
-            enc.dispatchThreads(MTLSize(width: B * C * spatial, height: 1, depth: 1),
-                               threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-        }
-        return out
-    }
-
-    /// Denormalize latents f32: out = latent * std + mean (per-channel). All f32.
+    /// Denormalize: out = latent * std + mean (f32)
     public func denormalize(_ buf: MTLBuffer, B: Int, C: Int, F: Int, H: Int, W: Int) -> MTLBuffer {
-        let spatial = F * H * W
-        return channelScaleBiasF32(x: buf, scale: stdOfMeansF32, bias: meanOfMeansF32,
-                                    B: B, C: C, spatial: spatial)
+        channelScaleBiasF32(x: buf, scale: stdOfMeansF32, bias: meanOfMeansF32,
+                            B: B, C: C, spatial: F * H * W)
     }
 
-    /// Normalize latents f32: out = (latent - mean) / std (per-channel). All f32.
+    /// Normalize: out = (latent - mean) / std (f32)
     public func normalize(_ buf: MTLBuffer, B: Int, C: Int, F: Int, H: Int, W: Int) -> MTLBuffer {
-        let spatial = F * H * W
-        // Compute scale=1/std, bias=-mean/std on CPU from f32 stats
         let stdPtr = stdOfMeansF32.contents().assumingMemoryBound(to: Float.self)
         let meanPtr = meanOfMeansF32.contents().assumingMemoryBound(to: Float.self)
         var scaleData = [Float](repeating: 0, count: C)
@@ -310,7 +136,180 @@ public class VAEDecoder {
         let scaleBuf = scaleData.withUnsafeBytes { ctx.device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)! }
         let biasBuf = biasData.withUnsafeBytes { ctx.device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)! }
         return channelScaleBiasF32(x: buf, scale: scaleBuf, bias: biasBuf,
-                                    B: B, C: C, spatial: spatial)
+                                    B: B, C: C, spatial: F * H * W)
+    }
+}
+
+// MARK: - VAE Decoder Model
+
+/// Describes a block to load on demand during decode.
+enum VAEBlockDesc {
+    case midBlock(idx: Int, ch: Int, teDim: Int, numRes: Int)
+    case depthToSpace(idx: Int, C_in: Int, C_out: Int)
+}
+
+public class VAEDecoder {
+    let convIn: Conv3DWeight        // 128 → 1024
+    let blockDescs: [VAEBlockDesc]  // lazy — loaded on demand during decode
+    let convOut: Conv3DWeight       // 128 → 48
+    let patchSize: Int = 4
+
+    // Stored for lazy block loading
+    let file: SafeTensorsFile
+    let prefix: String
+
+    // Timestep conditioning
+    let timestepScaleMultiplier: Float
+    let lastTimeEmbedder: TimestepEmbedderWeights
+    let lastScaleShiftTable: Tensor  // [2, 128] f16
+
+    // Per-channel latent statistics for denormalization
+    public let stats: VAELatentStats
+
+    public init(file: SafeTensorsFile, prefix: String = "decoder.", stats: VAELatentStats? = nil) throws {
+        self.file = file
+        self.prefix = prefix
+
+        // conv_in: [1024, 128, 3, 3, 3] — small, keep resident
+        convIn = VAEDecoder.loadConv(file: file, prefix: prefix, name: "conv_in", C_in: 128, C_out: 1024)
+
+        // up_blocks: 7 blocks — descriptors only, weights loaded on demand during decode
+        blockDescs = [
+            .midBlock(idx: 0, ch: 1024, teDim: 4096, numRes: 5),
+            .depthToSpace(idx: 1, C_in: 1024, C_out: 4096),
+            .midBlock(idx: 2, ch: 512, teDim: 2048, numRes: 5),
+            .depthToSpace(idx: 3, C_in: 512, C_out: 2048),
+            .midBlock(idx: 4, ch: 256, teDim: 1024, numRes: 5),
+            .depthToSpace(idx: 5, C_in: 256, C_out: 1024),
+            .midBlock(idx: 6, ch: 128, teDim: 512, numRes: 5),
+        ]
+
+        // conv_out: [48, 128, 3, 3, 3] — small, keep resident
+        convOut = VAEDecoder.loadConv(file: file, prefix: prefix, name: "conv_out", C_in: 128, C_out: 48)
+
+        // Timestep conditioning — tiny, keep resident
+        timestepScaleMultiplier = VAEDecoder.loadScalar(file: file, prefix: prefix, name: "timestep_scale_multiplier")
+        lastTimeEmbedder = VAEDecoder.loadTimeEmbedder(file: file, prefix: prefix, name: "last_time_embedder", outDim: 256)
+        lastScaleShiftTable = VAEDecoder.loadTensor(file: file, prefix: prefix, name: "last_scale_shift_table")
+
+        // Per-channel latent statistics — reuse if pre-loaded, otherwise load now
+        self.stats = stats ?? VAELatentStats.load(file: file, prefix: prefix)
+    }
+
+    // MARK: - Static weight loading helpers (used by init and lazy block loading)
+
+    static func loadTensor(file: SafeTensorsFile, prefix: String, name: String) -> Tensor {
+        let key = prefix + name
+        guard let info = file.tensors[key] else { fatalError("Weight not found: \(key)") }
+        let ptr = file.pointer(for: key)!
+        let ctx = MetalContext.shared
+        if info.dtype == .float16 {
+            let buf = ctx.device.makeBuffer(bytes: ptr, length: info.byteCount, options: .storageModeShared)!
+            return Tensor(buffer: buf, shape: info.shape, dtype: .float16)
+        } else if info.dtype == .float32 {
+            let count = info.byteCount / 4
+            let src = ptr.assumingMemoryBound(to: Float.self)
+            let buf = ctx.device.makeBuffer(length: count * 2, options: .storageModeShared)!
+            let dst = buf.contents().assumingMemoryBound(to: UInt16.self)
+            for i in 0..<count { dst[i] = float32ToFloat16(src[i]) }
+            return Tensor(buffer: buf, shape: info.shape, dtype: .float16)
+        } else if info.dtype == .bfloat16 {
+            let count = info.byteCount / 2
+            let src = ptr.assumingMemoryBound(to: UInt16.self)
+            let buf = ctx.device.makeBuffer(length: count * 2, options: .storageModeShared)!
+            let dst = buf.contents().assumingMemoryBound(to: UInt16.self)
+            for i in 0..<count {
+                let f = Float(bitPattern: UInt32(src[i]) << 16)
+                dst[i] = float32ToFloat16(f)
+            }
+            return Tensor(buffer: buf, shape: info.shape, dtype: .float16)
+        }
+        fatalError("Unsupported dtype: \(info.dtype)")
+    }
+
+    static func loadScalar(file: SafeTensorsFile, prefix: String, name: String) -> Float {
+        let key = prefix + name
+        guard let info = file.tensors[key] else { fatalError("Weight not found: \(key)") }
+        let ptr = file.pointer(for: key)!
+        if info.dtype == .float32 { return ptr.assumingMemoryBound(to: Float.self).pointee }
+        if info.dtype == .float16 { return float16ToFloat32(ptr.assumingMemoryBound(to: UInt16.self).pointee) }
+        fatalError("Unsupported dtype for scalar: \(info.dtype)")
+    }
+
+    static func loadConv(file: SafeTensorsFile, prefix: String, name: String, C_in: Int, C_out: Int, sD: Int = 1, sH: Int = 1, sW: Int = 1) -> Conv3DWeight {
+        let w = loadTensor(file: file, prefix: prefix, name: "\(name).conv.weight")
+        let b = loadTensor(file: file, prefix: prefix, name: "\(name).conv.bias")
+        return Conv3DWeight(weight: w, bias: b, C_in: C_in, C_out: C_out,
+                           kD: 3, kH: 3, kW: 3, sD: sD, sH: sH, sW: sW)
+    }
+
+    static func loadTimeEmbedder(file: SafeTensorsFile, prefix: String, name: String, outDim: Int) -> TimestepEmbedderWeights {
+        return TimestepEmbedderWeights(
+            linear1Weight: loadTensor(file: file, prefix: prefix, name: "\(name).timestep_embedder.linear_1.weight"),
+            linear1Bias: loadTensor(file: file, prefix: prefix, name: "\(name).timestep_embedder.linear_1.bias"),
+            linear2Weight: loadTensor(file: file, prefix: prefix, name: "\(name).timestep_embedder.linear_2.weight"),
+            linear2Bias: loadTensor(file: file, prefix: prefix, name: "\(name).timestep_embedder.linear_2.bias"),
+            outDim: outDim
+        )
+    }
+
+    static func loadResBlock(file: SafeTensorsFile, prefix: String, name: String, ch: Int) -> ResBlockWeights {
+        return ResBlockWeights(
+            scaleShiftTable: loadTensor(file: file, prefix: prefix, name: "\(name).scale_shift_table"),
+            conv1: loadConv(file: file, prefix: prefix, name: "\(name).conv1", C_in: ch, C_out: ch),
+            conv2: loadConv(file: file, prefix: prefix, name: "\(name).conv2", C_in: ch, C_out: ch),
+            channels: ch
+        )
+    }
+
+    /// Load a MidBlock's weights on demand.
+    static func loadMidBlock(file: SafeTensorsFile, prefix: String, idx: Int, ch: Int, teDim: Int, numRes: Int) -> UNetMidBlockWeights {
+        let p = "up_blocks.\(idx)"
+        let te = loadTimeEmbedder(file: file, prefix: prefix, name: "\(p).time_embedder", outDim: teDim)
+        var resBlocks: [ResBlockWeights] = []
+        for r in 0..<numRes {
+            resBlocks.append(loadResBlock(file: file, prefix: prefix, name: "\(p).res_blocks.\(r)", ch: ch))
+        }
+        return UNetMidBlockWeights(timeEmbedder: te, resBlocks: resBlocks, channels: ch)
+    }
+
+    /// Load a DepthToSpace block's weights on demand.
+    static func loadDTSBlock(file: SafeTensorsFile, prefix: String, idx: Int, C_in: Int, C_out: Int) -> DepthToSpaceWeights {
+        let conv = loadConv(file: file, prefix: prefix, name: "up_blocks.\(idx).conv", C_in: C_in, C_out: C_out)
+        return DepthToSpaceWeights(conv: conv, stride: (2,2,2), residual: true, outChannelsReductionFactor: 2)
+    }
+
+    /// Denormalize latents: out = latent * std_of_means + mean_of_means (per-channel).
+    /// Input: [B, 128, F, H, W] f16. Stats are broadcast over spatial dims.
+    public func denormalize(_ latent: Tensor) -> Tensor {
+        let B = latent.shape[0], C = latent.shape[1]
+        let F = latent.shape[2], H = latent.shape[3], W = latent.shape[4]
+        let spatial = F * H * W
+        let out = Tensor.empty(latent.shape, dtype: .float16)
+        let pipe = KernelCache.shared.pipeline("channel_scale_bias")
+        var cU = UInt32(C), sU = UInt32(spatial)
+        MetalContext.shared.run { enc in
+            enc.setComputePipelineState(pipe)
+            enc.setBuffer(latent.buffer, offset: 0, index: 0)
+            enc.setBuffer(stats.stdOfMeans.buffer, offset: 0, index: 1)
+            enc.setBuffer(stats.meanOfMeans.buffer, offset: 0, index: 2)
+            enc.setBuffer(out.buffer, offset: 0, index: 3)
+            enc.setBytes(&cU, length: 4, index: 4)
+            enc.setBytes(&sU, length: 4, index: 5)
+            enc.dispatchThreads(MTLSize(width: B * C * spatial, height: 1, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        }
+        return out
+    }
+
+    /// Denormalize latents f32: out = latent * std + mean (per-channel). All f32.
+    public func denormalize(_ buf: MTLBuffer, B: Int, C: Int, F: Int, H: Int, W: Int) -> MTLBuffer {
+        stats.denormalize(buf, B: B, C: C, F: F, H: H, W: W)
+    }
+
+    /// Normalize latents f32: out = (latent - mean) / std (per-channel). All f32.
+    public func normalize(_ buf: MTLBuffer, B: Int, C: Int, F: Int, H: Int, W: Int) -> MTLBuffer {
+        stats.normalize(buf, B: B, C: C, F: F, H: H, W: W)
     }
 
     // MARK: - Decode
@@ -331,12 +330,9 @@ public class VAEDecoder {
         func step(_ msg: String) {
             let now = CFAbsoluteTimeGetCurrent()
             let dt = now - tLast
-            let elapsed = now - t0
             tLast = now
-            let line = String(format: "[%.2fs +%.3fs] %@", elapsed, dt, msg)
+            let line = String(format: "[PERF] +%.1fms %@", dt * 1000, msg)
             log?(line)
-            _debugLog += line + "\n"
-            try? _debugLog.write(toFile: "/Users/zimski/projects/oss/swift-llm/decode_log.txt", atomically: true, encoding: .utf8)
         }
 
         // Compute scaled timestep
@@ -379,17 +375,30 @@ public class VAEDecoder {
         if debug { step(tensorStats(x, label: "conv_in_out")) }
         step("conv_in done, shape [\(B),\(C),\(D),\(H),\(W)]")
 
-        // Process up_blocks
-        for (i, block) in upBlocks.enumerated() {
-            if let midBlock = block as? UNetMidBlockWeights {
-                step("up_block \(i): MidBlock(\(C), \(midBlock.resBlocks.count) res), spatial \(D)x\(H)x\(W)")
+        // Process up_blocks — load weights on demand
+        for (blockIdx, desc) in blockDescs.enumerated() {
+            let weights: Any
+            switch desc {
+            case .midBlock(let idx, let ch, let teDim, let numRes):
+                weights = VAEDecoder.loadMidBlock(file: file, prefix: prefix, idx: idx, ch: ch, teDim: teDim, numRes: numRes)
+            case .depthToSpace(let idx, let C_in, let C_out):
+                weights = VAEDecoder.loadDTSBlock(file: file, prefix: prefix, idx: idx, C_in: C_in, C_out: C_out)
+            }
+
+            switch desc {
+            case .midBlock(let idx, let ch, let teDim, let numRes):
+                step("up_block \(idx): MidBlock(\(C), \(numRes) res), spatial \(D)x\(H)x\(W) [MEM] Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB Proc=\(PeakMemoryTracker.shared.sample().current/1048576)MB Peak=\(PeakMemoryTracker.shared.peak/1048576)MB")
+                let midBlock = weights as! UNetMidBlockWeights
                 x = runMidBlock(x, weights: midBlock, B: B, C: C, D: D, H: H, W: W,
-                              timestep: tsTensor, scaledTimestep: scaledTimestep)
+                              timestep: tsTensor, scaledTimestep: scaledTimestep, perf: { log?("[PERF] " + $0) })
                 pool.reset(keeping: [x.buffer]); pool.purge()
-                if debug { step(tensorStats(x, label: "up_block_\(i)_out")) }
-            } else if let dtsBlock = block as? DepthToSpaceWeights {
-                step("up_block \(i): DepthToSpace(\(C)→\(dtsBlock.conv.C_out)), spatial \(D)x\(H)x\(W)")
-                x = runDepthToSpaceUpsample(x, weights: dtsBlock, B: B, C: C, D: D, H: H, W: W, causal: false)
+                step("up_block \(idx) done [MEM] Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB Proc=\(PeakMemoryTracker.shared.sample().current/1048576)MB Peak=\(PeakMemoryTracker.shared.peak/1048576)MB")
+                if debug { step(tensorStats(x, label: "up_block_\(idx)_out")) }
+
+            case .depthToSpace(let idx, _, let C_out):
+                step("up_block \(idx): DepthToSpace(\(C)→\(C_out)), spatial \(D)x\(H)x\(W) [MEM] Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB Proc=\(PeakMemoryTracker.shared.sample().current/1048576)MB Peak=\(PeakMemoryTracker.shared.peak/1048576)MB")
+                let dtsBlock = weights as! DepthToSpaceWeights
+                x = runDepthToSpaceUpsample(x, weights: dtsBlock, B: B, C: C, D: D, H: H, W: W, causal: false, perf: { log?("[PERF] " + $0) })
                 let (p1, p2, p3) = dtsBlock.stride
                 let newC = dtsBlock.conv.C_out / (p1 * p2 * p3)
                 if p1 == 2 {
@@ -401,7 +410,8 @@ public class VAEDecoder {
                 W = W * p3
                 C = newC
                 pool.reset(keeping: [x.buffer]); pool.purge()
-                if debug { step(tensorStats(x, label: "up_block_\(i)_out")) }
+                step("up_block \(idx) done [MEM] Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB Proc=\(PeakMemoryTracker.shared.sample().current/1048576)MB Peak=\(PeakMemoryTracker.shared.peak/1048576)MB")
+                if debug { step(tensorStats(x, label: "up_block_\(idx)_out")) }
             }
         }
 
@@ -417,7 +427,7 @@ public class VAEDecoder {
         if debug {
             step(tensorStats(x, label: "after_silu"))
         }
-        step("last AdaLN + silu done")
+        step("last AdaLN + silu done [MEM] Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB Proc=\(PeakMemoryTracker.shared.sample().current/1048576)MB Peak=\(PeakMemoryTracker.shared.peak/1048576)MB")
 
         // conv_out
         step("conv_out: \(C)→48, 3x3x3, spatial \(D)x\(H)x\(W)")
@@ -427,19 +437,21 @@ public class VAEDecoder {
         if debug { step(tensorStats(x, label: "after_conv_out")) }
 
         // unpatchify: [B, 48, F, H, W] → [B, 3, F, H*4, W*4]
-        step("unpatchify")
+        step("unpatchify [MEM] Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB Proc=\(PeakMemoryTracker.shared.sample().current/1048576)MB Peak=\(PeakMemoryTracker.shared.peak/1048576)MB")
         x = unpatchify3d(x, B: B, C_out: 3, F: D, H_in: H, W_in: W, patchSize: patchSize)
         pool.reset(keeping: [x.buffer]); pool.purge()
         if debug { step(tensorStats(x, label: "final_output")) }
 
-        log?("decode complete, shape \(x.shape)")
+        let finalMem = PeakMemoryTracker.shared.sample()
+        log?("decode complete, shape \(x.shape) [MEM] Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB Proc=\(finalMem.current/1048576)MB PEAK=\(finalMem.peak/1048576)MB")
         return x
     }
 
     // MARK: - Block execution
 
     private func causalConv3d(_ x: Tensor, conv: Conv3DWeight, B: Int,
-                             C_in: Int, D: Int, H: Int, W: Int, causal: Bool) -> Tensor {
+                             C_in: Int, D: Int, H: Int, W: Int, causal: Bool,
+                             into: MTLBuffer? = nil) -> Tensor {
         // Causal padding: repeat first frame (time_kernel_size - 1) times at front
         // Non-causal padding: repeat first frame (ks-1)/2 times, last frame (ks-1)/2 times
         let timePad: Int
@@ -482,61 +494,103 @@ public class VAEDecoder {
                      B: B, C_in: C_in, D: D_padded, H: H, W: W,
                      C_out: conv.C_out, kD: conv.kD, kH: conv.kH, kW: conv.kW,
                      sD: conv.sD, sH: conv.sH, sW: conv.sW,
-                     pD: 0, pH: spatialPad, pW: spatialPad)
+                     pD: 0, pH: spatialPad, pW: spatialPad, into: into)
+    }
+
+    /// Pad input for causal/non-causal conv3d, returning the padded tensor.
+    /// Call this separately from conv3d so the caller can free the original input.
+    private func causalPadForConv(_ x: Tensor, conv: Conv3DWeight, B: Int,
+                                  C_in: Int, D: Int, H: Int, W: Int, causal: Bool) -> Tensor {
+        var padded = x
+        var D_padded = D
+        if causal {
+            let timePad = conv.kD - 1
+            if timePad > 0 {
+                padded = causalPad(x, B: B, C: C_in, D: D, H: H, W: W, pad: timePad)
+                D_padded = D + timePad
+            }
+        } else {
+            let halfPad = (conv.kD - 1) / 2
+            if halfPad > 0 {
+                padded = causalPad(x, B: B, C: C_in, D: D, H: H, W: W, pad: halfPad)
+                D_padded = D + halfPad
+                padded = causalPadBack(padded, B: B, C: C_in, D: D_padded, H: H, W: W, pad: halfPad)
+                D_padded = D_padded + halfPad
+            }
+        }
+        return padded
     }
 
     // causalPadBack is now a GPU kernel in Ops.swift — no CPU memcpy needed
 
     private func runMidBlock(_ x: Tensor, weights: UNetMidBlockWeights, B: Int, C: Int, D: Int, H: Int, W: Int,
-                            timestep: Tensor, scaledTimestep: Float) -> Tensor {
+                            timestep: Tensor, scaledTimestep: Float,
+                            perf: ((String) -> Void)? = nil) -> Tensor {
         // Compute timestep embedding: sinusoidal(256) → linear1 → silu → linear2
         let tsEmb = computeTimestepEmbedding(timestep, embedder: weights.timeEmbedder, B: B,
                                              scaledTimestep: scaledTimestep)
-        // tsEmb: [B, outDim] f16 → reshape to [B, outDim, 1, 1, 1] for broadcasting
-        // outDim = channels * 4 for mid blocks
 
         let pool = MetalContext.shared.bufferPool
+        // Pre-allocate ONE scratch buffer shared across all resblocks for conv outputs
+        let convOutBytes = B * C * D * H * W * 2
+        let scratch = MetalContext.shared.device.makeBuffer(length: convOutBytes, options: .storageModeShared)!
+        let blockStart = CFAbsoluteTimeGetCurrent()
         var h = x
-        for resBlock in weights.resBlocks {
-            h = runResBlock(h, weights: resBlock, B: B, C: C, D: D, H: H, W: W, tsEmb: tsEmb)
-            pool.reset(keeping: [h.buffer, tsEmb.buffer])
+        for (i, resBlock) in weights.resBlocks.enumerated() {
+            let t0 = CFAbsoluteTimeGetCurrent()
+            h = runResBlock(h, weights: resBlock, B: B, C: C, D: D, H: H, W: W, tsEmb: tsEmb, scratch: scratch)
+            pool.reset(keeping: [h.buffer, tsEmb.buffer, scratch])
             pool.purge()
+            let dt = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+            let wall = (CFAbsoluteTimeGetCurrent() - blockStart) * 1000
+            let (memCur, memPeak) = PeakMemoryTracker.shared.sample()
+            perf?(String(format: "  res%d: %.1fms [wall=%.1fms] [MEM] Metal=%dMB Proc=%dMB Peak=%dMB", i, dt, wall,
+                         MetalContext.shared.device.currentAllocatedSize / 1048576, memCur / 1048576, memPeak / 1048576))
         }
+        // Free scratch explicitly — don't keep it in pool
         return h
     }
 
     private func runResBlock(_ x: Tensor, weights: ResBlockWeights, B: Int, C: Int, D: Int, H: Int, W: Int,
-                            tsEmb: Tensor) -> Tensor {
+                            tsEmb: Tensor, scratch: MTLBuffer? = nil) -> Tensor {
         let pool = MetalContext.shared.bufferPool
         let spatialSize = D * H * W
+
+        // Pre-allocate scratch buffer for conv outputs to avoid peak = x + h + conv_out
+        // With scratch, conv writes into scratch while h is freed by pool during conv
+        let convOutBytes = B * C * D * H * W * 2  // C_in == C_out for resblocks
+        let scratchBuf = scratch ?? MetalContext.shared.device.makeBuffer(length: convOutBytes, options: .storageModeShared)!
         var h = x
 
-        // norm1 (pixel_norm)
-        h = pixelNorm3d(h, B: B, C: C, spatialSize: spatialSize)
-
-        // AdaLN: compute all 4 scale/shift values, then apply
+        // AdaLN: compute all 4 scale/shift values
         let (scale1, shift1, scale2, shift2) = computeAdaLN(tsEmb, table: weights.scaleShiftTable, B: B, C: C)
-        h = scaleShift3d(h, scale: scale1, shift: shift1, C: C, spatialSize: spatialSize)
 
-        h = silu(h)
+        // Fused: pixel_norm + scale_shift + silu
+        h = pixelNormScaleShiftSilu(h, scale: scale1, shift: shift1, B: B, C: C, spatialSize: spatialSize)
 
-        // Free pre-conv intermediates, keep x (for residual), h (conv input), scale2/shift2/tsEmb (for later)
+        // conv1: pad first, free norm output, then conv into scratch
+        var padded = causalPadForConv(h, conv: weights.conv1, B: B, C_in: C, D: D, H: H, W: W, causal: false)
+        // Free h (norm output) — padded has its own copy
+        pool.reset(keeping: [x.buffer, padded.buffer, scratchBuf, scale2.buffer, shift2.buffer, tsEmb.buffer]); pool.purge()
+        let spatialPad1 = weights.conv1.kH / 2
+        h = conv3d(padded, weight: weights.conv1.weight, bias: weights.conv1.bias,
+                   B: B, C_in: C, D: padded.shape[2], H: H, W: W,
+                   C_out: C, kD: weights.conv1.kD, kH: weights.conv1.kH, kW: weights.conv1.kW,
+                   pH: spatialPad1, pW: spatialPad1, into: scratchBuf)
+        // h now points to scratchBuf. Free padded.
         pool.reset(keeping: [x.buffer, h.buffer, scale2.buffer, shift2.buffer, tsEmb.buffer]); pool.purge()
 
-        // conv1
-        h = causalConv3d(h, conv: weights.conv1, B: B, C_in: C, D: D, H: H, W: W, causal: false)
-        pool.reset(keeping: [x.buffer, h.buffer, scale2.buffer, shift2.buffer, tsEmb.buffer]); pool.purge()
+        // Fused: pixel_norm + scale_shift + silu (norm2)
+        h = pixelNormScaleShiftSilu(h, scale: scale2, shift: shift2, B: B, C: C, spatialSize: spatialSize)
 
-        // norm2 + adaln2 + silu
-        h = pixelNorm3d(h, B: B, C: C, spatialSize: spatialSize)
-        h = scaleShift3d(h, scale: scale2, shift: shift2, C: C, spatialSize: spatialSize)
-        h = silu(h)
-
-        // Free pre-conv2 intermediates
-        pool.reset(keeping: [x.buffer, h.buffer, tsEmb.buffer]); pool.purge()
-
-        // conv2
-        h = causalConv3d(h, conv: weights.conv2, B: B, C_in: C, D: D, H: H, W: W, causal: false)
+        // conv2: pad first, free norm output, then conv into scratch
+        padded = causalPadForConv(h, conv: weights.conv2, B: B, C_in: C, D: D, H: H, W: W, causal: false)
+        pool.reset(keeping: [x.buffer, padded.buffer, scratchBuf, tsEmb.buffer]); pool.purge()
+        let spatialPad2 = weights.conv2.kH / 2
+        h = conv3d(padded, weight: weights.conv2.weight, bias: weights.conv2.bias,
+                   B: B, C_in: C, D: padded.shape[2], H: H, W: W,
+                   C_out: C, kD: weights.conv2.kD, kH: weights.conv2.kH, kW: weights.conv2.kW,
+                   pH: spatialPad2, pW: spatialPad2, into: scratchBuf)
         pool.reset(keeping: [x.buffer, h.buffer, tsEmb.buffer]); pool.purge()
 
         // residual
@@ -545,7 +599,8 @@ public class VAEDecoder {
     }
 
     private func runDepthToSpaceUpsample(_ x: Tensor, weights: DepthToSpaceWeights, B: Int,
-                                        C: Int, D: Int, H: Int, W: Int, causal: Bool) -> Tensor {
+                                        C: Int, D: Int, H: Int, W: Int, causal: Bool,
+                                        perf: ((String) -> Void)? = nil) -> Tensor {
         let pool = MetalContext.shared.bufferPool
         let (p1, p2, p3) = weights.stride
         let prodStride = p1 * p2 * p3  // 8
@@ -575,14 +630,18 @@ public class VAEDecoder {
             pool.reset(keeping: [x.buffer, x_repeated.buffer]); pool.purge()
 
             // Conv path: conv → pixel_shuffle → temporal slice
+            var t0 = CFAbsoluteTimeGetCurrent()
             var h = causalConv3d(x, conv: weights.conv, B: B, C_in: C, D: D, H: H, W: W, causal: causal)
+            perf?(String(format: "  dts_conv(%d→%d): %.1fms [MEM] Metal=%dMB Proc=%dMB Peak=%dMB", C, weights.conv.C_out, (CFAbsoluteTimeGetCurrent() - t0) * 1000, MetalContext.shared.device.currentAllocatedSize / 1048576, PeakMemoryTracker.shared.sample().current / 1048576, PeakMemoryTracker.shared.peak / 1048576))
             // x no longer needed
             pool.reset(keeping: [h.buffer, x_repeated.buffer]); pool.purge()
 
             let convOutC = weights.conv.C_out
+            t0 = CFAbsoluteTimeGetCurrent()
             let tmp = h
             h = pixelShuffle3d(tmp, B: B, C_out: convOutC / prodStride, D_in: D, H_in: H, W_in: W,
                               p1: p1, p2: p2, p3: p3)
+            perf?(String(format: "  dts_shuffle: %.1fms", (CFAbsoluteTimeGetCurrent() - t0) * 1000))
             pool.reset(keeping: [h.buffer, x_repeated.buffer]); pool.purge()
 
             if p1 == 2 {
@@ -593,7 +652,9 @@ public class VAEDecoder {
 
             result = elemAdd(h, x_repeated)
         } else {
+            var t0nb = CFAbsoluteTimeGetCurrent()
             var h = causalConv3d(x, conv: weights.conv, B: B, C_in: C, D: D, H: H, W: W, causal: causal)
+            perf?(String(format: "  dts_conv(%d→%d): %.1fms [MEM] %dMB", C, weights.conv.C_out, (CFAbsoluteTimeGetCurrent() - t0nb) * 1000, MetalContext.shared.device.currentAllocatedSize / 1048576))
             pool.reset(keeping: [h.buffer]); pool.purge()
             let convOutC = weights.conv.C_out
             h = pixelShuffle3d(h, B: B, C_out: convOutC / prodStride, D_in: D, H_in: H, W_in: W,

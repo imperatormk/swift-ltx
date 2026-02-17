@@ -851,6 +851,16 @@ public final class KernelCache: @unchecked Sendable {
         out[tid] += float(bias[col]);
     }
 
+    kernel void broadcast_bias_add_f16(
+        device half* out [[buffer(0)]],
+        device const half* bias [[buffer(1)]],
+        constant uint& N [[buffer(2)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        uint col = tid % N;
+        out[tid] = half(float(out[tid]) + float(bias[col]));
+    }
+
     // f16 → f32
     kernel void cast_f16_to_f32(
         device const half* src [[buffer(0)]],
@@ -867,6 +877,26 @@ public final class KernelCache: @unchecked Sendable {
         uint tid [[thread_position_in_grid]])
     {
         acc[tid] += float(x[tid]);
+    }
+
+    // Scale f16 by constant: out = x * scale
+    kernel void scale_f16(
+        device const half* x [[buffer(0)]],
+        device half* out [[buffer(1)]],
+        constant half& scale [[buffer(2)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        out[tid] = x[tid] * scale;
+    }
+
+    // Element-wise multiply f16: out = a * b
+    kernel void elem_mul_f16(
+        device const half* a [[buffer(0)]],
+        device const half* b [[buffer(1)]],
+        device half* out [[buffer(2)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        out[tid] = a[tid] * b[tid];
     }
 
     // f32 = f32 * f16 (element-wise multiply f32 by f16)
@@ -1034,6 +1064,41 @@ public final class KernelCache: @unchecked Sendable {
         for (uint c = 0; c < C; c++) {
             uint idx = base + c * spatial_size;
             output[idx] = half(float(input[idx]) * inv_rms);
+        }
+    }
+
+    // Fused pixel_norm + scale_shift + silu: for each spatial position,
+    // compute RMS over C, then out[c] = silu(x[c]*inv_rms*(1+scale[c]) + shift[c])
+    // x: [B, C, D, H, W], scale/shift: [B, C]. Grid: (spatialSize, B).
+    kernel void pixel_norm_scale_shift_silu(
+        device const half* input [[buffer(0)]],
+        device const half* scale [[buffer(1)]],
+        device const half* shift [[buffer(2)]],
+        device half* output [[buffer(3)]],
+        constant uint& C [[buffer(4)]],
+        constant uint& spatial_size [[buffer(5)]],
+        constant float& eps [[buffer(6)]],
+        uint2 tid [[thread_position_in_grid]])
+    {
+        uint s = tid.x;
+        uint b = tid.y;
+        if (s >= spatial_size) return;
+
+        float sum_sq = 0;
+        uint base = b * C * spatial_size + s;
+        uint scale_base = b * C;
+        for (uint c = 0; c < C; c++) {
+            float v = float(input[base + c * spatial_size]);
+            sum_sq += v * v;
+        }
+        float inv_rms = rsqrt(sum_sq / float(C) + eps);
+        for (uint c = 0; c < C; c++) {
+            uint idx = base + c * spatial_size;
+            float normed = float(input[idx]) * inv_rms;
+            float sc = float(scale[scale_base + c]);
+            float sh = float(shift[scale_base + c]);
+            float v = normed * (1.0f + sc) + sh;
+            output[idx] = half(v / (1.0f + exp(-v)));
         }
     }
 
@@ -1280,8 +1345,9 @@ public final class KernelCache: @unchecked Sendable {
         uint iw = ow / p;  // r index
         uint r = ow % p;
 
-        // Input channel = c * p * p + q * p + r  (q=row patch, r=col patch)
-        uint ic = c * p * p + q * p + r;
+        // Input channel = c * p * p + r * p + q  (r=col/width patch, q=row/height patch)
+        // Matches Python: rearrange("b (c r q) f h w -> b c (f p) (h q) (w r)")
+        uint ic = c * p * p + r * p + q;
         uint in_idx = b * C_in * F * H_in * W_in + ic * F * H_in * W_in + f * H_in * W_in + ih * W_in + iw;
         output[tid] = input[in_idx];
     }
@@ -1333,6 +1399,177 @@ public final class KernelCache: @unchecked Sendable {
             sum += float(x[b * K + k]) * float(weight[n * K + k]);
         }
         output[b * N + n] = half(sum);
+    }
+
+    // Im2col for 3D conv: gather ALL kernel positions at once into [chunk, C_in*kSize] matrix.
+    // One GEMM replaces 27 separate gather+GEMM+accumulate dispatches.
+    // Grid: (K, chunk_rows) where K = C_in * kD * kH * kW
+    // params: [C_in, D_in, H_in, W_in, D_out, H_out, W_out, kD, kH, kW, sD, sH, sW, pD, pH, pW, rowOff]
+    kernel void im2col_3d(
+        device const half* input [[buffer(0)]],
+        device half* output [[buffer(1)]],
+        constant uint* params [[buffer(2)]],
+        uint2 tid [[thread_position_in_grid]])
+    {
+        uint C_in = params[0];
+        uint D_in = params[1], H_in = params[2], W_in = params[3];
+        uint D_out = params[4], H_out = params[5], W_out = params[6];
+        uint kD = params[7], kH = params[8], kW = params[9];
+        uint sD = params[10], sH = params[11], sW = params[12];
+        uint pD = params[13], pH = params[14], pW = params[15];
+        uint rowOff = params[16];
+
+        uint kSize = kD * kH * kW;
+        uint K = C_in * kSize;
+        uint col = tid.x;
+        uint m_local = tid.y;
+        if (col >= K) return;
+
+        uint m = rowOff + m_local;
+        uint spatial_out = D_out * H_out * W_out;
+        uint b = m / spatial_out;
+        uint rem = m % spatial_out;
+        uint od = rem / (H_out * W_out);
+        uint rem2 = rem % (H_out * W_out);
+        uint oh = rem2 / W_out;
+        uint ow = rem2 % W_out;
+
+        uint ci = col / kSize;
+        uint kRem = col % kSize;
+        uint fd = kRem / (kH * kW);
+        uint kRem2 = kRem % (kH * kW);
+        uint fh = kRem2 / kW;
+        uint fw = kRem2 % kW;
+
+        int id = int(od * sD + fd) - int(pD);
+        int ih = int(oh * sH + fh) - int(pH);
+        int iw = int(ow * sW + fw) - int(pW);
+
+        half val = 0;
+        if (id >= 0 && uint(id) < D_in && ih >= 0 && uint(ih) < H_in && iw >= 0 && uint(iw) < W_in) {
+            val = input[b * C_in * D_in * H_in * W_in + ci * D_in * H_in * W_in
+                       + uint(id) * H_in * W_in + uint(ih) * W_in + uint(iw)];
+        }
+        output[m_local * K + col] = val;
+    }
+
+    // Scatter GEMM result [M, C_out] row-major to NCHW output + bias. Single pass.
+    // params: [C_out, spatial_out, rowOff]
+    // Grid: rows * C_out
+    kernel void scatter_bias_nchw(
+        device const half* gemm_out [[buffer(0)]],
+        device const half* bias_data [[buffer(1)]],
+        device half* output [[buffer(2)]],
+        constant uint* params [[buffer(3)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        uint C_out = params[0];
+        uint spatial = params[1];
+        uint rowOff = params[2];
+
+        uint m_local = tid / C_out;
+        uint c = tid % C_out;
+        uint m = rowOff + m_local;
+        uint b = m / spatial;
+        uint s = m % spatial;
+
+        uint out_idx = b * C_out * spatial + c * spatial + s;
+        output[out_idx] = half(float(gemm_out[m_local * C_out + c]) + float(bias_data[c]));
+    }
+
+    // Same as scatter_bias_nchw but reads f32 GEMM output (for f32-accumulation conv3d).
+    // gemm_out is [rows, C_out] f32, bias is [C_out] f16, output is [B, C_out, spatial] f16.
+    kernel void scatter_bias_nchw_f32in(
+        device const float* gemm_out [[buffer(0)]],
+        device const half* bias_data [[buffer(1)]],
+        device half* output [[buffer(2)]],
+        constant uint* params [[buffer(3)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        uint C_out = params[0];
+        uint spatial = params[1];
+        uint rowOff = params[2];
+
+        uint m_local = tid / C_out;
+        uint c = tid % C_out;
+        uint m = rowOff + m_local;
+        uint b = m / spatial;
+        uint s = m % spatial;
+
+        uint out_idx = b * C_out * spatial + c * spatial + s;
+        output[out_idx] = half(gemm_out[m_local * C_out + c] + float(bias_data[c]));
+    }
+
+    // Transpose weight from [C_out, K] to [K, C_out] for im2col GEMM.
+    // Grid: (K, C_out)
+    kernel void transpose_weight(
+        device const half* input [[buffer(0)]],
+        device half* output [[buffer(1)]],
+        constant uint2& dims [[buffer(2)]],  // (C_out, K)
+        uint2 tid [[thread_position_in_grid]])
+    {
+        uint k = tid.x;
+        uint co = tid.y;
+        uint C_out = dims.x, K = dims.y;
+        if (k >= K || co >= C_out) return;
+        output[k * C_out + co] = input[co * K + k];
+    }
+
+    // Direct conv3d: 1 thread per output element, loops over C_in × kD × kH × kW inline.
+    // params: [C_in, D_in, H_in, W_in, C_out, D_out, H_out, W_out, kD, kH, kW, sD, sH, sW, pD, pH, pW, d_offset]
+    // d_offset: which D-slice of output to compute (for D-tiled dispatch)
+    // Grid: (H_out * W_out, C_out, B)
+    kernel void conv3d_direct(
+        device const half* input [[buffer(0)]],
+        device const half* weight [[buffer(1)]],
+        device const half* bias_data [[buffer(2)]],
+        device half* output [[buffer(3)]],
+        constant uint* params [[buffer(4)]],
+        uint3 tid [[thread_position_in_grid]])
+    {
+        uint C_in = params[0];
+        uint D_in = params[1], H_in = params[2], W_in = params[3];
+        uint C_out = params[4];
+        uint D_out = params[5], H_out = params[6], W_out = params[7];
+        uint kD = params[8], kH = params[9], kW = params[10];
+        uint sD = params[11], sH = params[12], sW = params[13];
+        uint pD = params[14], pH = params[15], pW = params[16];
+        uint d_out = params[17];  // D-slice offset
+
+        uint hw_idx = tid.x;
+        uint co = tid.y;
+        uint b = tid.z;
+        if (hw_idx >= H_out * W_out || co >= C_out) return;
+
+        uint h_out = hw_idx / W_out;
+        uint w_out = hw_idx % W_out;
+
+        float sum = float(bias_data[co]);
+        uint kSize = kD * kH * kW;
+
+        for (uint ci = 0; ci < C_in; ci++) {
+            for (uint fd = 0; fd < kD; fd++) {
+                int d_in = int(d_out * sD + fd) - int(pD);
+                if (d_in < 0 || uint(d_in) >= D_in) continue;
+                for (uint fh = 0; fh < kH; fh++) {
+                    int h_in = int(h_out * sH + fh) - int(pH);
+                    if (h_in < 0 || uint(h_in) >= H_in) continue;
+                    for (uint fw = 0; fw < kW; fw++) {
+                        int w_in = int(w_out * sW + fw) - int(pW);
+                        if (w_in < 0 || uint(w_in) >= W_in) continue;
+
+                        uint in_idx = (b * C_in + ci) * D_in * H_in * W_in
+                                    + uint(d_in) * H_in * W_in + uint(h_in) * W_in + uint(w_in);
+                        uint w_idx = co * C_in * kSize + ci * kSize + fd * kH * kW + fh * kW + fw;
+                        sum += float(input[in_idx]) * float(weight[w_idx]);
+                    }
+                }
+            }
+        }
+
+        uint spatial = D_out * H_out * W_out;
+        uint out_idx = (b * C_out + co) * spatial + d_out * H_out * W_out + h_out * W_out + w_out;
+        output[out_idx] = half(sum);
     }
 
     // Gather input for one kernel position: for each output position m,
@@ -1530,6 +1767,18 @@ public final class KernelCache: @unchecked Sendable {
         out[tid] = 0.5f * v * (1.0f + tanh(inner));
     }
 
+    kernel void gelu_approximate_f16(
+        device const half* x [[buffer(0)]],
+        device half* out [[buffer(1)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        float v = float(x[tid]);
+        float c = 0.7978845608f;
+        float inner = c * (v + 0.044715f * v * v * v);
+        inner = clamp(inner, -10.0f, 10.0f);
+        out[tid] = half(0.5f * v * (1.0f + tanh(inner)));
+    }
+
     // Fused GEGLU f32: reads f32, writes f32
     kernel void geglu_f32(
         device const float* a [[buffer(0)]],
@@ -1542,6 +1791,19 @@ public final class KernelCache: @unchecked Sendable {
         float inner = c * (v + 0.044715f * v * v * v);
         float gelu = 0.5f * v * (1.0f + tanh(inner));
         out[tid] = gelu * b[tid];
+    }
+
+    kernel void geglu_f16(
+        device const half* a [[buffer(0)]],
+        device const half* b [[buffer(1)]],
+        device half* out [[buffer(2)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        float v = float(a[tid]);
+        float c = 0.7978845608f;
+        float inner = c * (v + 0.044715f * v * v * v);
+        float gelu = 0.5f * v * (1.0f + tanh(inner));
+        out[tid] = half(gelu * float(b[tid]));
     }
 
     // Layer Norm: out[i] = (x[i] - mean) / sqrt(var + eps) * weight[i] + bias[i]
@@ -1889,6 +2151,57 @@ public final class KernelCache: @unchecked Sendable {
         uint tid [[thread_position_in_grid]])
     {
         out[tid] = x[tid] * (1.0f + scale[tid]) + shift[tid];
+    }
+
+    // Fused broadcast + adaln modulate f32: out = x * (1 + scale[b*D+d]) + shift[b*D+d]
+    // scale/shift are [B, dim], x/out are [B, numTokens, dim]. Broadcasts inline.
+    kernel void adaln_modulate_broadcast_f32(
+        device const float* x [[buffer(0)]],
+        device const float* scale [[buffer(1)]],
+        device const float* shift [[buffer(2)]],
+        device float* out [[buffer(3)]],
+        constant uint& N [[buffer(4)]],
+        constant uint& D [[buffer(5)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        uint ND = N * D;
+        uint b = tid / ND;
+        uint d = tid % D;
+        float s = scale[b * D + d];
+        float sh = shift[b * D + d];
+        out[tid] = x[tid] * (1.0f + s) + sh;
+    }
+
+    // Fused broadcast + scale f32: out = x * (1 + scale[b*D+d])
+    // scale is [B, dim], x/out are [B, numTokens, dim]. No shift.
+    kernel void scale_broadcast_f32(
+        device const float* x [[buffer(0)]],
+        device const float* scale [[buffer(1)]],
+        device float* out [[buffer(2)]],
+        constant uint& N [[buffer(3)]],
+        constant uint& D [[buffer(4)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        uint ND = N * D;
+        uint b = tid / ND;
+        uint d = tid % D;
+        out[tid] = x[tid] * (1.0f + scale[b * D + d]);
+    }
+
+    // Fused broadcast + elem mul f32: out = x * gate[b*D+d]
+    // gate is [B, dim], x/out are [B, numTokens, dim].
+    kernel void elem_mul_broadcast_f32(
+        device const float* x [[buffer(0)]],
+        device const float* gate [[buffer(1)]],
+        device float* out [[buffer(2)]],
+        constant uint& N [[buffer(3)]],
+        constant uint& D [[buffer(4)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        uint ND = N * D;
+        uint b = tid / ND;
+        uint d = tid % D;
+        out[tid] = x[tid] * gate[b * D + d];
     }
 
     // 3D RoPE f32 with batch broadcast: freqs are [seqLen, dim], src is [B*seqLen, dim]

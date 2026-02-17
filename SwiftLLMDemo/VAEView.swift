@@ -114,9 +114,25 @@ struct VAEView: View {
                         // Debug log
                         if showDebug, !runner.debugLog.isEmpty {
                             VStack(alignment: .leading, spacing: 4) {
-                                Text("DEBUG")
-                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                    .foregroundStyle(.yellow)
+                                HStack {
+                                    Text("DEBUG")
+                                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                        .foregroundStyle(.yellow)
+                                    Spacer()
+                                    Button(action: {
+                                        #if os(macOS)
+                                        NSPasteboard.general.clearContents()
+                                        NSPasteboard.general.setString(runner.debugLog, forType: .string)
+                                        #else
+                                        UIPasteboard.general.string = runner.debugLog
+                                        #endif
+                                    }) {
+                                        Image(systemName: "doc.on.doc")
+                                            .font(.system(size: 12))
+                                            .foregroundStyle(.yellow)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
                                 Text(runner.debugLog)
                                     .font(.system(size: 10, weight: .regular, design: .monospaced))
                                     .foregroundStyle(.yellow.opacity(0.8))

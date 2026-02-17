@@ -79,10 +79,21 @@ public struct DiTLinear {
         return applyF32in(xF32, M: M)
     }
 
-    /// f32 input × weight → f32 output. Weight can be bf16 or f32.
+    /// f16 input × f16 weight → f16 output (Tensor).
+    public func applyF16(_ x: Tensor, M: Int) -> Tensor {
+        let out = simpleMatmulF16(x, weight, M: M, K: K, N: N)
+        if let bias {
+            addBiasF16(out, bias: bias, M: M, N: N)
+        }
+        return out
+    }
+
+    /// f32 input × weight → f32 output. Weight can be f16, bf16, or f32.
     public func applyF32in(_ x: MTLBuffer, M: Int) -> MTLBuffer {
         let f32buf: MTLBuffer
         switch weight.dtype {
+        case .float16:
+            f32buf = matmulF32xF16(x, weight, M: M, K: K, N: N)
         case .bfloat16:
             f32buf = matmulF32xBF16(x, weight.buffer, M: M, K: K, N: N)
         default:
@@ -668,6 +679,7 @@ public class DiTModel {
             autoreleasepool {
                 let block = weights.loadBlock(i)
                 flog?("[MEM] block\(i) loaded Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB")
+                MetalContext.shared.beginBatch()
                 hiddenF32 = transformerBlock(
                     hiddenF32, block: block,
                     cosFreqs: cosFreqs, sinFreqs: sinFreqs,
@@ -676,6 +688,7 @@ public class DiTModel {
                     timestepEmbF32: timestepEmbF32,
                     B: B, numTokens: numTokens,
                     blockIdx: i)
+                MetalContext.shared.endBatch()
                 flog?("[MEM] block\(i) computed Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB")
                 pool.reset(keeping: [hiddenF32, hiddenStatesF32, timestepEmbF32,
                                      embeddedTimestepF32, cosFreqs, sinFreqs]
@@ -683,16 +696,17 @@ public class DiTModel {
                 // block dropped here — autoreleasepool forces immediate Metal buffer dealloc
             }
             let s = pool.stats
-            flog?("[MEM] block\(i) freed Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB pool: act=\(s.active/1024)KB/\(s.activeCount) free=\(s.free/1024)KB/\(s.freeCount)")
+            flog?("[MEM] block\(i) freed Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB pool: act=\(s.active/1024)KB/\(s.freeCount)")
         }
 
         // 5. Output — all f32, return f32 directly
         let normOutF32 = weights.normOut.applyF32(hiddenF32, dim: dim, rows: B * numTokens)
         flog?("normOut(f32): \(f32Stats(normOutF32, count: count))")
         let (finalShiftF32, finalScaleF32) = adaLNCombine2SharedF32(embeddedTimestepF32, table: weights.scaleShiftTable, B: B, C: dim)
-        let scaleBcast = broadcastToSeqF32(finalScaleF32, numTokens: numTokens, dim: dim, B: B)
-        let shiftBcast = broadcastToSeqF32(finalShiftF32, numTokens: numTokens, dim: dim, B: B)
-        let modulatedF32 = adalnModulateF32(normOutF32, scale: scaleBcast, shift: shiftBcast, count: count)
+        let modulatedF32 = adalnModulateBroadcastF32(normOutF32,
+            scale: finalScaleF32, scaleOffset: 0,
+            shift: finalShiftF32, shiftOffset: 0,
+            numTokens: numTokens, dim: dim, B: B)
         flog?("afterAdaLN(f32): \(f32Stats(modulatedF32, count: count))")
         let projOutF32 = weights.projOut.applyF32in(modulatedF32, M: B * numTokens)
         flog?("projOut(f32): \(f32Stats(projOutF32, count: B * numTokens * config.outChannels))")
@@ -725,14 +739,15 @@ public class DiTModel {
         var normHiddenF32: MTLBuffer
         if numAdaParams == 6 {
             normHiddenF32 = block.norm1.applyF32(hiddenF32, dim: dim, rows: rows)
-            let scaleBcast = broadcastToSeqF32(ada.buffer, numTokens: numTokens, dim: dim, B: B, inputOffset: ada.offset(1))
-            let shiftBcast = broadcastToSeqF32(ada.buffer, numTokens: numTokens, dim: dim, B: B, inputOffset: ada.offset(0))
-            normHiddenF32 = adalnModulateF32(normHiddenF32, scale: scaleBcast, shift: shiftBcast, count: count)
+            normHiddenF32 = adalnModulateBroadcastF32(normHiddenF32,
+                scale: ada.buffer, scaleOffset: ada.offset(1),
+                shift: ada.buffer, shiftOffset: ada.offset(0),
+                numTokens: numTokens, dim: dim, B: B)
         } else {
             normHiddenF32 = block.norm1.applyF32(hiddenF32, dim: dim, rows: rows)
-            let scaleBcast = broadcastToSeqF32(ada.buffer, numTokens: numTokens, dim: dim, B: B, inputOffset: ada.offset(0))
-            let onePlusS = onePlusF32(scaleBcast, count: count)
-            normHiddenF32 = elemMulF32(normHiddenF32, onePlusS, count: count)
+            normHiddenF32 = scaleBroadcastF32(normHiddenF32,
+                scale: ada.buffer, scaleOffset: ada.offset(0),
+                numTokens: numTokens, dim: dim, B: B)
         }
 
         if blockIdx == 0 { forwardLog?("  normHidden(attn1 input): \(f32Stats(normHiddenF32, count: count))") }
@@ -745,8 +760,8 @@ public class DiTModel {
 
         // Gate f32 * attnOut f32 → f32, add to residual
         let gateIdx = numAdaParams == 6 ? 2 : 1
-        let gateBcast = broadcastToSeqF32(ada.buffer, numTokens: numTokens, dim: dim, B: B, inputOffset: ada.offset(gateIdx))
-        let gatedAttn = elemMulF32(attnOutF32, gateBcast, count: count)
+        let gatedAttn = elemMulBroadcastF32(attnOutF32, gate: ada.buffer, gateOffset: ada.offset(gateIdx),
+                                             numTokens: numTokens, dim: dim, B: B)
         if blockIdx == 0 { forwardLog?("  gatedAttn: \(f32Stats(gatedAttn, count: count))") }
         var resF32 = hiddenF32
         elemAddF32(resF32, gatedAttn, count: count)
@@ -769,21 +784,22 @@ public class DiTModel {
         var normFFF32: MTLBuffer
         if numAdaParams == 6 {
             normFFF32 = block.norm2.applyF32(resF32, dim: dim, rows: rows)
-            let scaleBcast = broadcastToSeqF32(ada.buffer, numTokens: numTokens, dim: dim, B: B, inputOffset: ada.offset(4))
-            let shiftBcast = broadcastToSeqF32(ada.buffer, numTokens: numTokens, dim: dim, B: B, inputOffset: ada.offset(3))
-            normFFF32 = adalnModulateF32(normFFF32, scale: scaleBcast, shift: shiftBcast, count: count)
+            normFFF32 = adalnModulateBroadcastF32(normFFF32,
+                scale: ada.buffer, scaleOffset: ada.offset(4),
+                shift: ada.buffer, shiftOffset: ada.offset(3),
+                numTokens: numTokens, dim: dim, B: B)
         } else {
             normFFF32 = block.norm2.applyF32(resF32, dim: dim, rows: rows)
-            let scaleBcast = broadcastToSeqF32(ada.buffer, numTokens: numTokens, dim: dim, B: B, inputOffset: ada.offset(2))
-            let onePlusS = onePlusF32(scaleBcast, count: count)
-            normFFF32 = elemMulF32(normFFF32, onePlusS, count: count)
+            normFFF32 = scaleBroadcastF32(normFFF32,
+                scale: ada.buffer, scaleOffset: ada.offset(2),
+                numTokens: numTokens, dim: dim, B: B)
         }
 
         let ffOutF32 = ffnF32(normFFF32, ff: block.ff, M: rows, dim: dim)
         if blockIdx == 0 { forwardLog?("  ffOut: \(f32Stats(ffOutF32, count: count))") }
         let gateMLPIdx = numAdaParams == 6 ? 5 : 3
-        let gateMLPBcast = broadcastToSeqF32(ada.buffer, numTokens: numTokens, dim: dim, B: B, inputOffset: ada.offset(gateMLPIdx))
-        let gatedFF = elemMulF32(ffOutF32, gateMLPBcast, count: count)
+        let gatedFF = elemMulBroadcastF32(ffOutF32, gate: ada.buffer, gateOffset: ada.offset(gateMLPIdx),
+                                           numTokens: numTokens, dim: dim, B: B)
         if blockIdx == 0 { forwardLog?("  gatedFF: \(f32Stats(gatedFF, count: count))") }
         elemAddF32(resF32, gatedFF, count: count)
 
@@ -865,26 +881,29 @@ public class DiTModel {
         return outF32
     }
 
-    /// FFN all-f32: GEGLU or GELU activation → projOut. Returns f32 MTLBuffer.
+    /// FFN hybrid: FA GEMM (f32×f16→f32) for matmuls, f16 for activation.
+    /// proj1 in f32, cast to f16 for gelu, cast back to f32, proj2 in f32.
     private func ffnF32(_ x: MTLBuffer, ff: DiTFFNWeights, M: Int, dim: Int) -> MTLBuffer {
-        let projF32 = ff.proj.applyF32in(x, M: M)
+        let projF32 = ff.proj.applyF32in(x, M: M)  // [M, projN] f32 — FA GEMM, fast
         let projN = ff.proj.N
 
         if ff.isGeglu {
             let innerDim = projN / 2
             let halfCount = M * innerDim
-            // GEGLU f32: gelu(second half) * first half, using buffer offset for the split
-            let out = MetalContext.shared.bufferPool.get(length: halfCount * 4)
-            let pipe = KernelCache.shared.pipeline("geglu_f32")
+            // Cast to f16 for GEGLU activation (halves the memory for the big intermediate)
+            let projF16 = castF32toF16(projF32, count: M * projN, shape: [M, projN])
+            let out = Tensor.empty([M, innerDim], dtype: .float16)
+            let pipe = KernelCache.shared.pipeline("geglu_f16")
             MetalContext.shared.run { enc in
                 enc.setComputePipelineState(pipe)
-                enc.setBuffer(projF32, offset: halfCount * 4, index: 0)  // gate (second half)
-                enc.setBuffer(projF32, offset: 0, index: 1)              // value (first half)
-                enc.setBuffer(out, offset: 0, index: 2)
+                enc.setBuffer(projF16.buffer, offset: halfCount * 2, index: 0)
+                enc.setBuffer(projF16.buffer, offset: 0, index: 1)
+                enc.setBuffer(out.buffer, offset: 0, index: 2)
                 enc.dispatchThreads(MTLSize(width: halfCount, height: 1, depth: 1),
                                    threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
             }
-            return ff.projOut.applyF32in(out, M: M)
+            let outF32 = castF16toF32(out)
+            return ff.projOut.applyF32in(outF32, M: M)  // FA GEMM, fast
         } else {
             let count = M * projN
             let activated = geluApproximateF32(projF32, count: count)
@@ -1025,17 +1044,9 @@ public class LTXPipeline {
         }
         log?("timesteps: \(scheduler.timesteps.prefix(5))...")
 
-        #if os(macOS)
-        let noisePath = NSString(string: "~/projects/oss/swift-llm/fixtures/mlx_noise_f32.bin").expandingTildeInPath
-        #else
-        let noisePath = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true)[0] + "/mlx_noise_f32.bin"
-        #endif
-        let noiseData = try! Data(contentsOf: URL(fileURLWithPath: noisePath))
-        let noiseCount = noiseData.count / 4
-        let noiseF32 = noiseData.withUnsafeBytes { ptr in
-            MetalContext.shared.device.makeBuffer(bytes: ptr.baseAddress!, length: ptr.count, options: .storageModeShared)!
-        }
-        log?("noise (mlx f32): \(f32Stats(noiseF32, count: noiseCount))")
+        let totalLatentCount = B * latentChannels * numFrames * height * width
+        let noiseF32 = randomNormalF32(count: totalLatentCount, seed: seed)
+        log?("noise f32: \(f32Stats(noiseF32, count: totalLatentCount))")
 
         var (tokensF32, latentCoords) = patchifier.patchifyF32(noiseF32, B: B, C: latentChannels,
                                                                 F: numFrames, H: height, W: width)
@@ -1058,6 +1069,7 @@ public class LTXPipeline {
             let t = scheduler.timesteps[i]
             let tsTensor = Tensor([t], shape: [B])
 
+            let stepStart = CFAbsoluteTimeGetCurrent()
             let noisePredF32 = model.forward(
                 hiddenStatesF32: tokensF32,
                 cosFreqs: cosFreqs, sinFreqs: sinFreqs,
@@ -1065,11 +1077,11 @@ public class LTXPipeline {
                 timestep: tsTensor,
                 B: B, numTokens: numTokens)
 
-            log?("[MEM] step\(i) post-fwd Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB")
-            log?("step \(i) t=\(String(format:"%.4f",t)) pred_f32: \(f32Stats(noisePredF32, count: tokenCount)) tokens_in_f32: \(f32Stats(tokensF32, count: tokenCount))")
+            let fwdTime = CFAbsoluteTimeGetCurrent() - stepStart
             tokensF32 = scheduler.stepF32(modelOutput: noisePredF32, timestepIndex: i, sample: tokensF32, count: tokenCount)
+            let totalTime = CFAbsoluteTimeGetCurrent() - stepStart
             pool.reset(keeping: [tokensF32, cosFreqs, sinFreqs, textEmbeddings.buffer])
-            log?("[MEM] step\(i) post-reset Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB")
+            log?("[PERF] step\(i) t=\(String(format:"%.4f",t)): fwd=\(String(format:"%.1f",fwdTime*1000))ms total=\(String(format:"%.1f",totalTime*1000))ms")
 
             if i == 0 { model.forwardLog = nil }
             progressHandler?(i + 1, scheduler.timesteps.count)
@@ -1127,6 +1139,7 @@ public class LTXPipeline {
             let t = explicitTimesteps[i]
             let tsTensor = Tensor([t], shape: [B])
 
+            let stepStart = CFAbsoluteTimeGetCurrent()
             let noisePredF32 = model.forward(
                 hiddenStatesF32: tokensF32,
                 cosFreqs: cosFreqs, sinFreqs: sinFreqs,
@@ -1134,9 +1147,11 @@ public class LTXPipeline {
                 timestep: tsTensor,
                 B: B, numTokens: numTokens)
 
-            log?("pass2 step \(i) t=\(String(format:"%.4f",t)) pred_f32: \(f32Stats(noisePredF32, count: tokenCount))")
+            let fwdTime = CFAbsoluteTimeGetCurrent() - stepStart
             tokensF32 = scheduler.stepF32(modelOutput: noisePredF32, timestepIndex: i, sample: tokensF32, count: tokenCount)
+            let totalTime = CFAbsoluteTimeGetCurrent() - stepStart
             pool.reset(keeping: [tokensF32, cosFreqs, sinFreqs, textEmbeddings.buffer])
+            log?("[PERF] step\(i) t=\(String(format:"%.4f",t)): fwd=\(String(format:"%.1f",fwdTime*1000))ms total=\(String(format:"%.1f",totalTime*1000))ms")
 
             progressHandler?(i + 1, explicitTimesteps.count)
         }
@@ -1247,7 +1262,7 @@ public func loadDiTWeights(from url: URL, config: LTXTransformerConfig = LTXTran
         return k
     }
 
-    // Load a tensor by name, searching all files. Returns f16 Metal buffer.
+    // Load a tensor by name, searching all files. Returns f32 Metal buffer.
     func load(_ name: String) -> Tensor? {
         let remapped = remap(name)
         let prefixed = "model.diffusion_model." + name

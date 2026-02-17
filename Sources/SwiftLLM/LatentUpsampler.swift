@@ -48,74 +48,94 @@ public class LatentUpsampler {
                         log: ((String) -> Void)? = nil) -> MTLBuffer {
         let C = weights.midChannels  // 512
         let pool = MetalContext.shared.bufferPool
+        var t0 = CFAbsoluteTimeGetCurrent()
+        func perf(_ label: String) {
+            let now = CFAbsoluteTimeGetCurrent()
+            log?("[PERF] \(label): \(String(format: "%.1fms", (now - t0) * 1000))")
+            t0 = now
+        }
 
         // Initial conv3d + groupnorm + silu
         var x = conv3dF32(latent, weight: weights.initialConv.weight, bias: weights.initialConv.bias,
                           B: B, C_in: 128, D: F, H: H, W: W,
                           C_out: C, kD: 3, kH: 3, kW: 3, pD: 1, pH: 1, pW: 1)
-        log?("initial_conv: \(f32Stats(x, count: B*C*F*H*W))")
+        perf("initial_conv3d(128→512)")
         x = groupNorm3dF32(x, weight: weights.initialNormWeight, bias: weights.initialNormBias,
                            B: B, C: C, spatialSize: F * H * W, numGroups: 32)
+        perf("initial_groupnorm")
         x = siluF32(x, count: B * C * F * H * W)
+        perf("initial_silu")
         pool.reset(keeping: [x])
-        log?("after initial: \(f32Stats(x, count: B*C*F*H*W))")
 
         // Pre-upsample ResBlocks
         for (i, rb) in weights.resBlocks.enumerated() {
-            x = resBlock(x, weights: rb, B: B, C: C, D: F, H: H, W: W)
+            x = resBlock(x, weights: rb, B: B, C: C, D: F, H: H, W: W, idx: "pre\(i)", log: log)
             pool.reset(keeping: [x])
-            log?("resBlock\(i): \(f32Stats(x, count: B*C*F*H*W))")
         }
 
-        // Spatial upsample: fold frames → Conv2d (as Conv3d D=1) → PixelShuffle2D → unfold
-        // x is [B, C, F, H, W] (NCFHW). Conv3d expects [B*F, C, 1, H, W] contiguous,
-        // so we must transpose [C, F, HW] → [F, C, HW] first.
+        // Spatial upsample
+        t0 = CFAbsoluteTimeGetCurrent()
         let folded = transposeSHF32(x, seqLen: C, nHeads: F, headDim: H * W)
-        // folded is now [B, F, C, H, W] = [B*F, C, H, W] contiguous
+        perf("transpose_CF→FC")
         var up = conv3dF32(folded, weight: weights.upsampleConv.weight, bias: weights.upsampleConv.bias,
                            B: B * F, C_in: C, D: 1, H: H, W: W,
                            C_out: C * 4, kD: 1, kH: 3, kW: 3, pD: 0, pH: 1, pW: 1)
-        log?("upsample_conv: \(f32Stats(up, count: B*F*C*4*H*W))")
+        perf("upsample_conv2d(512→2048)")
         up = pixelShuffle3dF32(up, B: B * F, C_out: C, D_in: 1, H_in: H, W_in: W, p1: 1, p2: 2, p3: 2)
+        perf("pixel_shuffle_2x")
         let newH = H * 2, newW = W * 2
-        log?("pixel_shuffle: \(f32Stats(up, count: B*F*C*newH*newW))")
-        // up is [B*F, C, H*2, W*2] = [F, C, newH*newW]. Transpose back to [C, F, newH*newW] = [B, C, F, H*2, W*2]
         x = transposeHSF32(up, seqLen: C, nHeads: F, headDim: newH * newW)
+        perf("transpose_FC→CF")
         pool.reset(keeping: [x])
 
         // Post-upsample ResBlocks
         for (i, rb) in weights.postResBlocks.enumerated() {
-            x = resBlock(x, weights: rb, B: B, C: C, D: F, H: newH, W: newW)
+            x = resBlock(x, weights: rb, B: B, C: C, D: F, H: newH, W: newW, idx: "post\(i)", log: log)
             pool.reset(keeping: [x])
-            log?("postResBlock\(i): \(f32Stats(x, count: B*C*F*newH*newW))")
         }
 
         // Final conv3d: 512 → 128
+        t0 = CFAbsoluteTimeGetCurrent()
         x = conv3dF32(x, weight: weights.finalConv.weight, bias: weights.finalConv.bias,
                       B: B, C_in: C, D: F, H: newH, W: newW,
                       C_out: 128, kD: 3, kH: 3, kW: 3, pD: 1, pH: 1, pW: 1)
+        perf("final_conv3d(512→128)")
         pool.reset(keeping: [x])
-        log?("final_conv: \(f32Stats(x, count: B*128*F*newH*newW))")
         return x
     }
 
     private func resBlock(_ x: MTLBuffer, weights w: UpsamplerResBlockWeights,
-                          B: Int, C: Int, D: Int, H: Int, W: Int) -> MTLBuffer {
+                          B: Int, C: Int, D: Int, H: Int, W: Int,
+                          idx: String = "", log: ((String) -> Void)? = nil) -> MTLBuffer {
         let spatial = D * H * W
         let count = B * C * spatial
+        var t0 = CFAbsoluteTimeGetCurrent()
+        func perf(_ label: String) {
+            let now = CFAbsoluteTimeGetCurrent()
+            log?("[PERF] rb_\(idx).\(label): \(String(format: "%.1fms", (now - t0) * 1000))")
+            t0 = now
+        }
         var h = conv3dF32(x, weight: w.conv1.weight, bias: w.conv1.bias,
                           B: B, C_in: C, D: D, H: H, W: W,
                           C_out: C, kD: 3, kH: 3, kW: 3, pD: 1, pH: 1, pW: 1)
+        perf("conv1")
         h = groupNorm3dF32(h, weight: w.norm1Weight, bias: w.norm1Bias,
                            B: B, C: C, spatialSize: spatial, numGroups: 32)
+        perf("gn1")
         h = siluF32(h, count: count)
+        perf("silu1")
         h = conv3dF32(h, weight: w.conv2.weight, bias: w.conv2.bias,
                       B: B, C_in: C, D: D, H: H, W: W,
                       C_out: C, kD: 3, kH: 3, kW: 3, pD: 1, pH: 1, pW: 1)
+        perf("conv2")
         h = groupNorm3dF32(h, weight: w.norm2Weight, bias: w.norm2Bias,
                            B: B, C: C, spatialSize: spatial, numGroups: 32)
+        perf("gn2")
         let added = elemAddF32OOP(h, x, count: count)
-        return siluF32(added, count: count)
+        perf("add")
+        let out = siluF32(added, count: count)
+        perf("silu2")
+        return out
     }
 }
 
