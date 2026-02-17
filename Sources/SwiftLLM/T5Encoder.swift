@@ -93,11 +93,10 @@ public class T5Encoder {
                 }
         }
 
-        log?("T5 embedding done, seqLen=\(S) \(f32Stats(hiddenBuf, count: S * dModel))")
+        log?("T5 embedding done, seqLen=\(S)")
 
         // Compute relative position bias: [numHeads, S, S] f32
         let posBias = computePositionBias(seqLen: S)
-        log?("T5 posBias: \(f32Stats(posBias, count: config.numHeads * S * S))")
 
         // Process layers
         var hidden = hiddenBuf
@@ -105,7 +104,6 @@ public class T5Encoder {
             let layerW = loadLayerWeights(layerIdx: layerIdx)
             debugLayer = false
             hidden = runLayer(hidden, weights: layerW, posBias: posBias, mask: nil, S: S)
-            log?("T5 layer \(layerIdx) done \(f32Stats(hidden, count: S * dModel))")
             // layerW goes out of scope → ARC frees MTLBuffers
         }
 

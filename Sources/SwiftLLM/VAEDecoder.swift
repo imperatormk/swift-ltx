@@ -224,7 +224,15 @@ public class VAEDecoder {
             }
             return Tensor(buffer: buf, shape: info.shape, dtype: .float16)
         }
-        fatalError("Unsupported dtype: \(info.dtype)")
+        if info.dtype == .int32 {
+            // NF4 quantized tensor — dequant to f16
+            let suffix = ".weight"
+            let baseKey = String(key.prefix(key.count - suffix.count))
+            return dequantNF4ToF16(file: file, key: key, info: info,
+                                    scalesKey: baseKey + ".scales",
+                                    biasesKey: baseKey + ".biases")
+        }
+        fatalError("Unsupported dtype: \(info.dtype) for \(key)")
     }
 
     static func loadScalar(file: SafeTensorsFile, prefix: String, name: String) -> Float {
@@ -237,10 +245,65 @@ public class VAEDecoder {
     }
 
     static func loadConv(file: SafeTensorsFile, prefix: String, name: String, C_in: Int, C_out: Int, sD: Int = 1, sH: Int = 1, sW: Int = 1) -> Conv3DWeight {
-        let w = loadTensor(file: file, prefix: prefix, name: "\(name).conv.weight")
+        let weightKey = prefix + "\(name).conv.weight"
+        let weightInfo = file.tensors[weightKey]!
+        let w: Tensor
+        if weightInfo.dtype == .int32 {
+            // NF4 quantized: dequant to f16 on load
+            w = dequantNF4ToF16(file: file, key: weightKey, info: weightInfo,
+                                scalesKey: prefix + "\(name).conv.scales",
+                                biasesKey: prefix + "\(name).conv.biases")
+        } else {
+            w = loadTensor(file: file, prefix: prefix, name: "\(name).conv.weight")
+        }
         let b = loadTensor(file: file, prefix: prefix, name: "\(name).conv.bias")
         return Conv3DWeight(weight: w, bias: b, C_in: C_in, C_out: C_out,
                            kD: 3, kH: 3, kW: 3, sD: sD, sH: sH, sW: sW)
+    }
+
+    /// Dequantize NF4 packed int32 → f16 tensor.
+    /// Weight: [N, K/8] int32 (8 nibbles per int32), Scales/Biases: [N, K/groupSize] f16.
+    /// Output: [N, K] f16 where K = cols from original shape.
+    private static let nf4Table: [Float] = [
+        -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+        -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+        0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
+        0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0
+    ]
+
+    private static func dequantNF4ToF16(file: SafeTensorsFile, key: String,
+                                         info: TensorInfo,
+                                         scalesKey: String, biasesKey: String) -> Tensor {
+        let N = info.shape[0]
+        let packedCols = info.shape[1]  // K/8
+        let K = packedCols * 8
+
+        let weightPtr = file.pointer(for: key)!.assumingMemoryBound(to: UInt32.self)
+        let scalesPtr = file.pointer(for: scalesKey)!.assumingMemoryBound(to: UInt16.self)
+        let biasesPtr = file.pointer(for: biasesKey)!.assumingMemoryBound(to: UInt16.self)
+
+        let scalesInfo = file.tensors[scalesKey]!
+        let groupSize = K / scalesInfo.shape[1]
+
+        let ctx = MetalContext.shared
+        let buf = ctx.device.makeBuffer(length: N * K * 2, options: .storageModeShared)!
+        let dst = buf.contents().assumingMemoryBound(to: UInt16.self)
+
+        for row in 0..<N {
+            for packedCol in 0..<packedCols {
+                let packed = weightPtr[row * packedCols + packedCol]
+                for nib in 0..<8 {
+                    let col = packedCol * 8 + nib
+                    let idx = Int((packed >> (nib * 4)) & 0xF)
+                    let group = col / groupSize
+                    let scale = Float(Float16(bitPattern: scalesPtr[row * scalesInfo.shape[1] + group]))
+                    let bias = Float(Float16(bitPattern: biasesPtr[row * scalesInfo.shape[1] + group]))
+                    let val = nf4Table[idx] * scale + bias
+                    dst[row * K + col] = Float16(val).bitPattern
+                }
+            }
+        }
+        return Tensor(buffer: buf, shape: [N, K], dtype: .float16)
     }
 
     static func loadTimeEmbedder(file: SafeTensorsFile, prefix: String, name: String, outDim: Int) -> TimestepEmbedderWeights {

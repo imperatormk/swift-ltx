@@ -1,7 +1,11 @@
 .build/
+build/
 .swiftpm/
 DerivedData/
 *.xcuserstate
 xcuserdata/
 Package.resolved
 *.txt
+conv3d_bench*
+conv3d_test*.metal
+conv3d_verify*

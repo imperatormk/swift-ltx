@@ -27,7 +27,7 @@ final class VideoRunner: ObservableObject {
     @Published var progress: (Int, Int)? = nil
 
     #if os(macOS)
-    @Published var ditPath = NSString(string: "~/Downloads/ltxv_dit_bf16.safetensors").expandingTildeInPath
+    @Published var ditPath = NSString(string: "~/Downloads/ltxv_dit_4bit.safetensors").expandingTildeInPath
     @Published var embeddingsPath = NSString(string: "~/Downloads/t5_embed_a_cat_walking_on_a_sunny_beach.safetensors").expandingTildeInPath
     @Published var vaePath = NSString(string: "~/Downloads/ltxv_vae_decoder_f16.safetensors").expandingTildeInPath
     @Published var upsamplerPath = NSString(string: "~/Downloads/ltxv-spatial-upscaler-0.9.8.safetensors").expandingTildeInPath
@@ -122,7 +122,7 @@ final class VideoRunner: ObservableObject {
                 let start = CFAbsoluteTimeGetCurrent()
 
                 func updateLog(_ msg: String, mem: Bool = false) {
-                    guard msg.contains("[PERF]") || msg.contains("[DEBUG]") else { return }
+                    guard msg.contains("[PERF]") else { return }
                     log += msg + "\n"
                     let snap = log
                     let (_, peak) = PeakMemoryTracker.shared.sample()
@@ -143,27 +143,32 @@ final class VideoRunner: ObservableObject {
                 let textSeqLen: Int
 
                 if useT5 {
-                    // Run T5-XXL 4-bit encoder
-                    updateStatus("Loading T5 encoder...")
-                    let tokenizer = try T5Tokenizer(url: URL(fileURLWithPath: t5Tok))
-                    let tokenIds = tokenizer.encode(prompt)
-                    updateLog(String(format: "[PERF] t5_tokenize: %d tokens", tokenIds.count))
+                    // Run T5-XXL 4-bit encoder (scoped to free weights after)
+                    let (t5Buf, t5Len, t5Time): (MTLBuffer, Int, Double) = try autoreleasepool {
+                        updateStatus("Loading T5 encoder...")
+                        let tokenizer = try T5Tokenizer(url: URL(fileURLWithPath: t5Tok))
+                        let tokenIds = tokenizer.encode(prompt)
+                        updateLog(String(format: "[PERF] t5_tokenize: %d tokens", tokenIds.count))
 
-                    updateStatus("Running T5 encoder (24 layers)...")
-                    let encoder = try T5Encoder(url: URL(fileURLWithPath: t5Weights))
-                    encoder.log = { msg in updateLog("[PERF] \(msg)") }
-                    let maxLen = 128
-                    let embBuf = encoder.encode(tokenIds: tokenIds, maxLength: maxLen)
+                        updateStatus("Running T5 encoder (24 layers)...")
+                        let encoder = try T5Encoder(url: URL(fileURLWithPath: t5Weights))
+                        encoder.log = { msg in updateLog("[PERF] \(msg)") }
+                        let maxLen = 128
+                        let embBuf = encoder.encode(tokenIds: tokenIds, maxLength: maxLen)
 
-                    // Trim to real tokens (before padding)
-                    let realTokens = min(tokenIds.count, maxLen)
-                    textSeqLen = realTokens
-                    let dim = 4096
-                    let bytes = realTokens * dim * 4
-                    let buf = MetalContext.shared.device.makeBuffer(length: bytes, options: .storageModeShared)!
-                    memcpy(buf.contents(), embBuf.contents(), bytes)
-                    textEmb = Tensor(buffer: buf, shape: [1, realTokens, dim], dtype: .float32)
-                    updateLog(String(format: "[PERF] t5_encode: %.1fms (seqLen=%d)", (CFAbsoluteTimeGetCurrent() - pt) * 1000, textSeqLen))
+                        let realTokens = min(tokenIds.count, maxLen)
+                        let dim = 4096
+                        let bytes = realTokens * dim * 4
+                        let buf = MetalContext.shared.device.makeBuffer(length: bytes, options: .storageModeShared)!
+                        memcpy(buf.contents(), embBuf.contents(), bytes)
+                        let elapsed = (CFAbsoluteTimeGetCurrent() - pt) * 1000
+                        return (buf, realTokens, elapsed)
+                        // encoder + tokenizer freed here
+                    }
+                    MetalContext.shared.bufferPool.releaseAll(keeping: [t5Buf])
+                    textSeqLen = t5Len
+                    textEmb = Tensor(buffer: t5Buf, shape: [1, t5Len, 4096], dtype: .float32)
+                    updateLog(String(format: "[PERF] t5_encode: %.1fms (seqLen=%d), Metal=%dMB", t5Time, textSeqLen, MetalContext.shared.device.currentAllocatedSize/1048576))
                 } else {
                     // Load pre-computed embeddings
                     let embURL = URL(fileURLWithPath: embPath)
@@ -196,18 +201,21 @@ final class VideoRunner: ObservableObject {
                     updateLog(String(format: "[PERF] t5_embeddings_load: %.1fms (seqLen=%d)", (CFAbsoluteTimeGetCurrent() - pt) * 1000, textSeqLen))
                 }
 
-                // Load VAE latent stats once (~1KB)
+                // Load VAE latent stats once (~1KB), then close the file to free mmap
                 pt = CFAbsoluteTimeGetCurrent()
-                let vaeFile = try SafeTensorsFile(url: URL(fileURLWithPath: vaePth))
-                let vaePrefix: String
-                if vaeFile.tensors.keys.contains(where: { $0.hasPrefix("decoder.") }) {
-                    vaePrefix = "decoder."
-                } else if vaeFile.tensors.keys.contains(where: { $0.hasPrefix("vae.decoder.") }) {
-                    vaePrefix = "vae.decoder."
-                } else {
-                    throw VideoRunnerError.noDecoderKeys
+                let latentStats: VAELatentStats = try autoreleasepool {
+                    let vaeFile = try SafeTensorsFile(url: URL(fileURLWithPath: vaePth))
+                    let vaePrefix: String
+                    if vaeFile.tensors.keys.contains(where: { $0.hasPrefix("decoder.") }) {
+                        vaePrefix = "decoder."
+                    } else if vaeFile.tensors.keys.contains(where: { $0.hasPrefix("vae.decoder.") }) {
+                        vaePrefix = "vae.decoder."
+                    } else {
+                        throw VideoRunnerError.noDecoderKeys
+                    }
+                    return VAELatentStats.load(file: vaeFile, prefix: vaePrefix)
+                    // vaeFile (mmap) freed here
                 }
-                let latentStats = VAELatentStats.load(file: vaeFile, prefix: vaePrefix)
                 updateLog(String(format: "[PERF] vae_stats_load: %.1fms", (CFAbsoluteTimeGetCurrent() - pt) * 1000))
 
                 // Two-pass: pass1 at ~2/3 target, upsampler 2x, pass2 at full
@@ -260,32 +268,28 @@ final class VideoRunner: ObservableObject {
                 MetalContext.shared.bufferPool.releaseAll(keeping: [pass1F32])
 
                 // === Stage 2: Upsampler + AdaIN (no VAE needed — stats already loaded) ===
-                updateLog(debugF32Stats("pass1F32_input", pass1F32, count: pass1Count))
+                // updateLog(debugF32Stats("pass1F32_input", pass1F32, count: pass1Count))
                 let upCount = 1 * latentC * nFrames * finalH * finalW
                 let adainedF32: MTLBuffer = autoreleasepool {
                     var s2t = CFAbsoluteTimeGetCurrent()
                     updateStatus("Loading upsampler...")
-                    let upWeights = try! loadUpsamplerWeights(from: URL(fileURLWithPath: upPath))
-                    let upsampler = LatentUpsampler(weights: upWeights)
-                    updateLog(String(format: "[PERF] S2 upsampler_load: %.1fms, Metal=%dMB", (CFAbsoluteTimeGetCurrent() - s2t) * 1000, dev.currentAllocatedSize/1048576), mem: true)
+                    let loader = try! UpsamplerWeightLoader(url: URL(fileURLWithPath: upPath))
+                    updateLog(String(format: "[PERF] S2 upsampler_open: %.1fms, Metal=%dMB", (CFAbsoluteTimeGetCurrent() - s2t) * 1000, dev.currentAllocatedSize/1048576), mem: true)
 
                     updateStatus("Upsampling latents (f32)...")
                     s2t = CFAbsoluteTimeGetCurrent()
                     let denormedPass1F32 = latentStats.denormalize(pass1F32, B: 1, C: latentC, F: nFrames, H: pass1H, W: pass1W)
                     updateLog(String(format: "[PERF] S2 denormalize: %.1fms", (CFAbsoluteTimeGetCurrent() - s2t) * 1000), mem: true)
-                    updateLog(debugF32Stats("denormed", denormedPass1F32, count: 1 * latentC * nFrames * pass1H * pass1W))
 
                     s2t = CFAbsoluteTimeGetCurrent()
-                    let upsampledF32 = upsampler.forward(denormedPass1F32, B: 1, F: nFrames, H: pass1H, W: pass1W) { msg in
+                    let upsampledF32 = upsamplerForward(denormedPass1F32, loader: loader, B: 1, F: nFrames, H: pass1H, W: pass1W) { msg in
                         updateLog("  \(msg)", mem: msg.contains("[PERF]"))
                     }
                     updateLog(String(format: "[PERF] S2 upsampler_forward: %.1fms", (CFAbsoluteTimeGetCurrent() - s2t) * 1000), mem: true)
-                    updateLog(debugF32Stats("upsampled", upsampledF32, count: upCount))
 
                     s2t = CFAbsoluteTimeGetCurrent()
                     let renormedF32 = latentStats.normalize(upsampledF32, B: 1, C: latentC, F: nFrames, H: finalH, W: finalW)
                     updateLog(String(format: "[PERF] S2 normalize: %.1fms", (CFAbsoluteTimeGetCurrent() - s2t) * 1000), mem: true)
-                    updateLog(debugF32Stats("renormed", renormedF32, count: upCount))
 
                     s2t = CFAbsoluteTimeGetCurrent()
                     let result = adainFilter(renormedF32, reference: pass1F32,
@@ -294,9 +298,8 @@ final class VideoRunner: ObservableObject {
                                              refShape: [1, latentC, nFrames, pass1H, pass1W],
                                              factor: 1.0)
                     updateLog(String(format: "[PERF] S2 adain: %.1fms", (CFAbsoluteTimeGetCurrent() - s2t) * 1000), mem: true)
-                    updateLog(debugF32Stats("adained", result, count: upCount))
                     return result
-                    // upsampler freed here
+                    // loader freed here
                 }
                 let s2 = MetalContext.shared.bufferPool.stats
                 updateLog(String(format: "S2 end: Metal=%dMB pool(act=%dMB/%d free=%dMB/%d)",
@@ -464,7 +467,7 @@ final class VideoRunner: ObservableObject {
                     let dst = adainF32.contents().assumingMemoryBound(to: Float.self)
                     for i in 0..<count { dst[i] = Float(src[i]) }
                 }
-                updateLog("AdaIN f32: \(f32Stats(adainF32, count: count))")
+                // updateLog("AdaIN f32: \(f32Stats(adainF32, count: count))")
 
                 let B = info.shape[0], latentC = info.shape[1], nFrames = info.shape[2]
                 let finalH = info.shape[3], finalW = info.shape[4]
@@ -509,7 +512,7 @@ final class VideoRunner: ObservableObject {
                     log: { msg in updateLog("  DiT: \(msg)") }
                 )
                 let pass2Count = B * latentC * nFrames * finalH * finalW
-                updateLog("Pass 2 latents f32: \(f32Stats(pass2F32, count: pass2Count))")
+                // updateLog("Pass 2 latents f32: \(f32Stats(pass2F32, count: pass2Count))")
 
                 // VAE decode — load on demand
                 updateStatus("Loading VAE...")

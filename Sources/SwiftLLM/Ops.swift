@@ -1744,7 +1744,7 @@ public func conv3dF32(_ x: MTLBuffer, weight: MTLBuffer, bias: MTLBuffer,
         return out
     }
 
-    // General path: im2col + single GEMM + scatter
+    // General path: chunked im2col + GEMM + scatter (caps im2col memory at 32MB)
     let kSize = kD * kH * kW
     let spatialOut = D_out * H_out * W_out
     let M = B * D_out * H_out * W_out
@@ -1753,40 +1753,72 @@ public func conv3dF32(_ x: MTLBuffer, weight: MTLBuffer, bias: MTLBuffer,
     let out = pool.get(length: outCount * 4)
     let ctx = MetalContext.shared
 
-    // im2col: build [M, C_in * kSize] matrix (temporary — recycled by pool.reset)
-    let im2colBuf = pool.get(length: M * K * 4)
-    var im2colParams: [UInt32] = [
-        UInt32(C_in), UInt32(D), UInt32(H), UInt32(W),
-        UInt32(D_out), UInt32(H_out), UInt32(W_out),
-        UInt32(kD), UInt32(kH), UInt32(kW),
-        UInt32(sD), UInt32(sH), UInt32(sW),
-        UInt32(pD), UInt32(pH), UInt32(pW)
-    ]
+    let maxIm2colBytes = 32 * 1024 * 1024  // 32MB cap
+    let chunkSize = min(M, max(256, maxIm2colBytes / (K * 4)))
+    let im2colBuf = pool.get(length: chunkSize * K * 4)
+    let gemmOutBuf = pool.get(length: chunkSize * C_out * 4)
+
     let im2colPipe = KernelCache.shared.pipeline("im2col_3d_f32")
-    ctx.run { enc in
-        enc.setComputePipelineState(im2colPipe)
-        enc.setBuffer(x, offset: 0, index: 0)
-        enc.setBuffer(im2colBuf, offset: 0, index: 1)
-        enc.setBytes(&im2colParams, length: im2colParams.count * 4, index: 2)
-        enc.dispatchThreads(MTLSize(width: K, height: M, depth: 1),
-                           threadsPerThreadgroup: MTLSize(width: min(256, K), height: 1, depth: 1))
-    }
-
-    // Single GEMM: [M, K] × [C_out, K]^T → [M, C_out]
-    // Weight is [C_out, C_in, kD, kH, kW] = [C_out, K] row-major — already correct for B^T
-    let gemmResult = matmulF32xF32Pooled(im2colBuf, weight, M: M, K: K, N: C_out)
-
-    // Scatter [M, C_out] row-major → [B, C_out, spatial] NCHW + bias
-    var scatterParams: [UInt32] = [UInt32(C_out), UInt32(spatialOut)]
     let scatterPipe = KernelCache.shared.pipeline("scatter_conv_output_f32")
-    ctx.run { enc in
-        enc.setComputePipelineState(scatterPipe)
-        enc.setBuffer(gemmResult, offset: 0, index: 0)
-        enc.setBuffer(bias, offset: 0, index: 1)
-        enc.setBuffer(out, offset: 0, index: 2)
-        enc.setBytes(&scatterParams, length: scatterParams.count * 4, index: 3)
-        enc.dispatchThreads(MTLSize(width: M * C_out, height: 1, depth: 1),
-                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+
+    var rowOff = 0
+    while rowOff < M {
+        let rows = min(chunkSize, M - rowOff)
+
+        // im2col chunk
+        var im2colParams: [UInt32] = [
+            UInt32(C_in), UInt32(D), UInt32(H), UInt32(W),
+            UInt32(D_out), UInt32(H_out), UInt32(W_out),
+            UInt32(kD), UInt32(kH), UInt32(kW),
+            UInt32(sD), UInt32(sH), UInt32(sW),
+            UInt32(pD), UInt32(pH), UInt32(pW),
+            UInt32(rowOff)
+        ]
+        ctx.run { enc in
+            enc.setComputePipelineState(im2colPipe)
+            enc.setBuffer(x, offset: 0, index: 0)
+            enc.setBuffer(im2colBuf, offset: 0, index: 1)
+            enc.setBytes(&im2colParams, length: im2colParams.count * 4, index: 2)
+            enc.dispatchThreads(MTLSize(width: K, height: rows, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: min(256, K), height: 1, depth: 1))
+        }
+
+        // GEMM: im2col[rows,K] × weight[C_out,K]^T → [rows, C_out]
+        var gm = UInt32(rows), gn = UInt32(C_out), gk = UInt32(K)
+        var gemmDesc = GEMMDescriptor()
+        gemmDesc.matrixDimensions = (M: gm, N: gn, K: gk)
+        gemmDesc.memoryPrecisions = (A: .FP32, B: .FP32, C: .FP32)
+        gemmDesc.transposeState = (A: false, B: true)
+        gemmDesc.quantizedB = false
+        let (kernel, pipeline) = GEMMKernel.pipeline(for: gemmDesc)
+        ctx.run { enc in
+            enc.setComputePipelineState(pipeline)
+            enc.setThreadgroupMemoryLength(Int(kernel.threadgroupMemoryAllocation), index: 0)
+            enc.setBuffer(im2colBuf, offset: 0, index: 0)
+            enc.setBuffer(weight, offset: 0, index: 1)
+            enc.setBuffer(gemmOutBuf, offset: 0, index: 2)
+            let gridSize = MTLSize(
+                width: (C_out + Int(kernel.blockDimensions.N) - 1) / Int(kernel.blockDimensions.N),
+                height: (rows + Int(kernel.blockDimensions.M) - 1) / Int(kernel.blockDimensions.M),
+                depth: 1)
+            enc.dispatchThreadgroups(
+                gridSize,
+                threadsPerThreadgroup: MTLSize(width: Int(kernel.threadgroupSize), height: 1, depth: 1))
+        }
+
+        // Scatter chunk [rows, C_out] → out NCHW + bias
+        var scatterParams: [UInt32] = [UInt32(C_out), UInt32(spatialOut), UInt32(rowOff)]
+        ctx.run { enc in
+            enc.setComputePipelineState(scatterPipe)
+            enc.setBuffer(gemmOutBuf, offset: 0, index: 0)
+            enc.setBuffer(bias, offset: 0, index: 1)
+            enc.setBuffer(out, offset: 0, index: 2)
+            enc.setBytes(&scatterParams, length: scatterParams.count * 4, index: 3)
+            enc.dispatchThreads(MTLSize(width: rows * C_out, height: 1, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        }
+
+        rowOff += rows
     }
     return out
 }

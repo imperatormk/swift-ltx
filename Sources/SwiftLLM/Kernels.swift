@@ -2605,10 +2605,12 @@ public final class KernelCache: @unchecked Sendable {
         uint kD = params[7], kH = params[8], kW = params[9];
         uint sD = params[10], sH = params[11], sW = params[12];
         uint pD = params[13], pH = params[14], pW = params[15];
+        uint rowOff = params[16];  // chunk offset into global M
 
         uint kSize = kD * kH * kW;
         uint col = tid.x;  // 0..C_in*kSize-1
-        uint m = tid.y;    // 0..M-1
+        uint localRow = tid.y;    // 0..chunkRows-1
+        uint m = localRow + rowOff;  // global row
         if (col >= C_in * kSize) return;
 
         uint ic = col / kSize;
@@ -2634,13 +2636,12 @@ public final class KernelCache: @unchecked Sendable {
             uint HW_in = H_in * W_in;
             val = input[b * C_in * D_in * HW_in + ic * D_in * HW_in + uint(id) * HW_in + uint(ih) * W_in + uint(iw)];
         }
-        output[m * C_in * kSize + col] = val;
+        output[localRow * C_in * kSize + col] = val;
     }
 
-    // Scatter GEMM result [M, C_out] row-major → [B, C_out, spatial] NCHW + bias.
-    // Single pass (no accumulation needed since im2col+GEMM does it all at once).
-    // params: [C_out, spatial]
-    // Grid: M * C_out
+    // Scatter GEMM result [rows, C_out] row-major → [B, C_out, spatial] NCHW + bias.
+    // params: [C_out, spatial, rowOff]
+    // Grid: rows * C_out
     kernel void scatter_conv_output_f32(
         device const float* gemm_out [[buffer(0)]],
         device const float* bias_data [[buffer(1)]],
@@ -2650,14 +2651,16 @@ public final class KernelCache: @unchecked Sendable {
     {
         uint C_out = params[0];
         uint spatial = params[1];
+        uint rowOff = params[2];
 
-        uint m = tid / C_out;
+        uint localRow = tid / C_out;
         uint c = tid % C_out;
+        uint m = localRow + rowOff;  // global row
         uint b = m / spatial;
         uint s = m % spatial;
 
         uint out_idx = b * C_out * spatial + c * spatial + s;
-        output[out_idx] = gemm_out[m * C_out + c] + bias_data[c];
+        output[out_idx] = gemm_out[localRow * C_out + c] + bias_data[c];
     }
 
     // Group norm 3D f32: input/output float, weight/bias float.

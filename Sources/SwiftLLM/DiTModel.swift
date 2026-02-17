@@ -44,17 +44,25 @@ public struct RectifiedFlowConfig {
 
 /// Linear layer weights: weight [N, K] (bf16 or f32), bias [N] f16 (optional), biasF32 [N] f32 (optional).
 public struct DiTLinear {
-    public let weight: Tensor    // [N, K] bf16 or f32
+    public let weight: Tensor    // [N, K] bf16/f16/f32, or [N, K/8] int32 (NF4 packed)
     public let bias: Tensor?     // [N] f16
     public let biasF32: MTLBuffer?  // [N] f32 (for all-f32 path)
     public let K: Int
     public let N: Int
+    // NF4 quantized fields (nil for dense weights)
+    public let q4Scales: Tensor?   // [N, K/groupSize] f16
+    public let q4Biases: Tensor?   // [N, K/groupSize] f16
+    public let q4GroupSize: Int
 
-    public init(weight: Tensor, bias: Tensor?, K: Int, N: Int) {
+    public init(weight: Tensor, bias: Tensor?, K: Int, N: Int,
+                q4Scales: Tensor? = nil, q4Biases: Tensor? = nil, q4GroupSize: Int = 64) {
         self.weight = weight
         self.bias = bias
         self.K = K
         self.N = N
+        self.q4Scales = q4Scales
+        self.q4Biases = q4Biases
+        self.q4GroupSize = q4GroupSize
         // Pre-convert bias to f32
         if let b = bias {
             let buf = MetalContext.shared.device.makeBuffer(length: N * 4, options: .storageModeShared)!
@@ -66,6 +74,8 @@ public struct DiTLinear {
             self.biasF32 = nil
         }
     }
+
+    public var isQ4: Bool { q4Scales != nil }
 
     /// out = x @ W^T + bias. x: [M, K] f16, out: [M, N] f16. All compute in f32.
     public func apply(_ x: Tensor, M: Int) -> Tensor {
@@ -88,16 +98,25 @@ public struct DiTLinear {
         return out
     }
 
-    /// f32 input × weight → f32 output. Weight can be f16, bf16, or f32.
+    /// f32 input × weight → f32 output. Weight can be f16, bf16, f32, or NF4.
     public func applyF32in(_ x: MTLBuffer, M: Int) -> MTLBuffer {
         let f32buf: MTLBuffer
-        switch weight.dtype {
-        case .float16:
-            f32buf = matmulF32xF16(x, weight, M: M, K: K, N: N)
-        case .bfloat16:
-            f32buf = matmulF32xBF16(x, weight.buffer, M: M, K: K, N: N)
-        default:
-            f32buf = matmulF32xF32(x, weight.buffer, M: M, K: K, N: N)
+        if let scales = q4Scales, let biases = q4Biases {
+            // NF4 path: x is f32, cast to f16 for matmulQ4FastF32
+            let xF16 = castF32toF16(x, count: M * K, shape: [M, K])
+            f32buf = matmulQ4FastF32(
+                xF16,
+                weight: weight, scales: scales, biases: biases,
+                M: M, K: K, N: N, groupSize: q4GroupSize).buffer
+        } else {
+            switch weight.dtype {
+            case .float16:
+                f32buf = matmulF32xF16(x, weight, M: M, K: K, N: N)
+            case .bfloat16:
+                f32buf = matmulF32xBF16(x, weight.buffer, M: M, K: K, N: N)
+            default:
+                f32buf = matmulF32xF32(x, weight.buffer, M: M, K: K, N: N)
+            }
         }
         if let biasF32 {
             addBiasF32F32(f32buf, bias: biasF32, M: M, N: N)
@@ -674,11 +693,9 @@ public class DiTModel {
         }
 
         // 4. Transformer blocks — all f32, stream weights from mmap
-        flog?("[MEM] pre-blocks Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB")
         for i in 0..<weights.blockCount {
             autoreleasepool {
                 let block = weights.loadBlock(i)
-                flog?("[MEM] block\(i) loaded Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB")
                 MetalContext.shared.beginBatch()
                 hiddenF32 = transformerBlock(
                     hiddenF32, block: block,
@@ -693,6 +710,7 @@ public class DiTModel {
                 pool.reset(keeping: [hiddenF32, hiddenStatesF32, timestepEmbF32,
                                      embeddedTimestepF32, cosFreqs, sinFreqs]
                            + (encoderStatesF32.map { [$0] } ?? []))
+                pool.trimFreeList()
                 // block dropped here — autoreleasepool forces immediate Metal buffer dealloc
             }
             let s = pool.stats
@@ -1046,12 +1064,12 @@ public class LTXPipeline {
 
         let totalLatentCount = B * latentChannels * numFrames * height * width
         let noiseF32 = randomNormalF32(count: totalLatentCount, seed: seed)
-        log?("noise f32: \(f32Stats(noiseF32, count: totalLatentCount))")
+        // log?("noise f32: \(f32Stats(noiseF32, count: totalLatentCount))")
 
         var (tokensF32, latentCoords) = patchifier.patchifyF32(noiseF32, B: B, C: latentChannels,
                                                                 F: numFrames, H: height, W: width)
         let tokenCount = B * numTokens * latentChannels
-        log?("patchified f32: \(f32Stats(tokensF32, count: tokenCount))")
+        // log?("patchified f32: \(f32Stats(tokensF32, count: tokenCount))")
 
         let pixelCoords = latentToPixelCoords(latentCoords, frameRate: frameRate)
         let (cosFreqs, sinFreqs) = precomputeFreqsCIS3D(
@@ -1060,10 +1078,10 @@ public class LTXPipeline {
             theta: config.positionalEmbeddingTheta,
             dim: config.innerDim)
         log?("rope freqs precomputed (f32)")
-        log?("textEmb: shape=\(textEmbeddings.shape) \(f32Stats(textEmbeddings.buffer, count: textEmbeddings.count))")
+        log?("textEmb: shape=\(textEmbeddings.shape)")
+        log?("[MEM] pre-loop Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB")
 
         let pool = MetalContext.shared.bufferPool
-        model.forwardLog = { msg in log?("  fwd: \(msg)") }
 
         for i in 0..<scheduler.timesteps.count {
             let t = scheduler.timesteps[i]
@@ -1081,17 +1099,18 @@ public class LTXPipeline {
             tokensF32 = scheduler.stepF32(modelOutput: noisePredF32, timestepIndex: i, sample: tokensF32, count: tokenCount)
             let totalTime = CFAbsoluteTimeGetCurrent() - stepStart
             pool.reset(keeping: [tokensF32, cosFreqs, sinFreqs, textEmbeddings.buffer])
+            pool.trimFreeList()
             log?("[PERF] step\(i) t=\(String(format:"%.4f",t)): fwd=\(String(format:"%.1f",fwdTime*1000))ms total=\(String(format:"%.1f",totalTime*1000))ms")
 
             if i == 0 { model.forwardLog = nil }
             progressHandler?(i + 1, scheduler.timesteps.count)
         }
 
-        log?("final tokens f32: \(f32Stats(tokensF32, count: tokenCount))")
+        // log?("final tokens f32: \(f32Stats(tokensF32, count: tokenCount))")
         let resultF32 = patchifier.unpatchifyF32(tokensF32, B: B, C: config.outChannels,
                                                   F: numFrames, H: height, W: width)
         let resultCount = B * config.outChannels * numFrames * height * width
-        log?("unpatchified f32: \(f32Stats(resultF32, count: resultCount))")
+        // log?("unpatchified f32: \(f32Stats(resultF32, count: resultCount))")
         return resultF32
     }
 
@@ -1119,7 +1138,7 @@ public class LTXPipeline {
         let firstT = explicitTimesteps[0]
         let noiseF32 = noiseOverrideF32 ?? randomNormalF32(count: totalCount, seed: seed &+ 1)
         let noisedF32 = elemAddScaled2F32(noiseF32, inputLatentsF32, scaleA: firstT, scaleB: 1.0 - firstT, count: totalCount)
-        log?("noised latents f32 (t=\(firstT)): \(f32Stats(noisedF32, count: totalCount))")
+        // log?("noised latents f32 (t=\(firstT)): \(f32Stats(noisedF32, count: totalCount))")
 
         let numTokens = numFrames * (height / patchifier.patchSize) * (width / patchifier.patchSize)
         var (tokensF32, latentCoords) = patchifier.patchifyF32(noisedF32, B: B, C: C,
@@ -1151,6 +1170,7 @@ public class LTXPipeline {
             tokensF32 = scheduler.stepF32(modelOutput: noisePredF32, timestepIndex: i, sample: tokensF32, count: tokenCount)
             let totalTime = CFAbsoluteTimeGetCurrent() - stepStart
             pool.reset(keeping: [tokensF32, cosFreqs, sinFreqs, textEmbeddings.buffer])
+            pool.trimFreeList()
             log?("[PERF] step\(i) t=\(String(format:"%.4f",t)): fwd=\(String(format:"%.1f",fwdTime*1000))ms total=\(String(format:"%.1f",totalTime*1000))ms")
 
             progressHandler?(i + 1, explicitTimesteps.count)
@@ -1159,7 +1179,7 @@ public class LTXPipeline {
         let resultF32 = patchifier.unpatchifyF32(tokensF32, B: B, C: config.outChannels,
                                                   F: numFrames, H: height, W: width)
         let resultCount = B * config.outChannels * numFrames * height * width
-        log?("denoiseF32 result: \(f32Stats(resultF32, count: resultCount))")
+        // log?("denoiseF32 result: \(f32Stats(resultF32, count: resultCount))")
         return resultF32
     }
 }
@@ -1341,6 +1361,7 @@ public func loadDiTWeights(from url: URL, config: LTXTransformerConfig = LTXTran
                     case .bfloat16: dtype = .bfloat16
                     case .float16:  dtype = .float16
                     case .float32:  dtype = .float32
+                    case .int32:    dtype = .float32  // NF4 packed int32, store as-is
                     default: return nil
                     }
                     return Tensor(buffer: buf, shape: info.shape, dtype: dtype)
@@ -1351,11 +1372,35 @@ public func loadDiTWeights(from url: URL, config: LTXTransformerConfig = LTXTran
     }
 
     func loadLinear(prefix: String, K: Int, N: Int, bias: Bool = true) throws -> DiTLinear {
-        // Load weight in native format (bf16 stays bf16 — halves memory)
+        // Check for NF4 quantized format: .weight is int32
+        let wName = "\(prefix).weight"
+        let remappedW = remap(wName)
+        var isQ4 = false
+        for file in files {
+            for tryName in [wName, remappedW] {
+                if let info = file.tensors[tryName], info.dtype == .int32 { isQ4 = true; break }
+            }
+        }
+        if isQ4 {
+            // NF4: load weight (int32), scales (f16), biases (f16)
+            guard let w = loadNative("\(prefix).weight") else {
+                throw DiTLoadError.missingWeight("\(prefix).weight")
+            }
+            let scales = loadNative("\(prefix).scales")
+            let biases = loadNative("\(prefix).biases")
+            guard let scales, let biases else {
+                throw DiTLoadError.missingWeight("\(prefix).scales or .biases")
+            }
+            let b = bias ? loadAsF16("\(prefix).bias") : nil
+            let groupSize = K / scales.shape[1]
+            return DiTLinear(weight: w, bias: b, K: K, N: N,
+                             q4Scales: scales, q4Biases: biases, q4GroupSize: groupSize)
+        }
+        // Dense: load weight in native format (bf16 stays bf16 — halves memory)
         guard let w = loadNative("\(prefix).weight") else {
             throw DiTLoadError.missingWeight("\(prefix).weight")
         }
-        let b = bias ? loadAsF16("\(prefix).bias") : nil  // f16
+        let b = bias ? loadAsF16("\(prefix).bias") : nil
         return DiTLinear(weight: w, bias: b, K: K, N: N)
     }
 
@@ -1445,6 +1490,7 @@ public func loadDiTWeights(from url: URL, config: LTXTransformerConfig = LTXTran
             case .bfloat16: dtype = .bfloat16
             case .float16:  dtype = .float16
             case .float32:  dtype = .float32
+            case .int32:    dtype = .float32  // NF4 packed int32
             default: return nil
             }
             return Tensor(buffer: buf, shape: info.shape, dtype: dtype)
@@ -1485,6 +1531,13 @@ public func loadDiTWeights(from url: URL, config: LTXTransformerConfig = LTXTran
         func blkLoadLinear(_ prefix: String, K: Int, N: Int, bias: Bool = true) -> DiTLinear {
             let w = blkLoadNative("\(prefix).weight")!
             let b = bias ? blkLoadAsF16("\(prefix).bias") : nil
+            // Check for NF4: if scales tensor exists
+            if let scales = blkLoadNative("\(prefix).scales"),
+               let biases = blkLoadNative("\(prefix).biases") {
+                let groupSize = K / scales.shape[1]
+                return DiTLinear(weight: w, bias: b, K: K, N: N,
+                                 q4Scales: scales, q4Biases: biases, q4GroupSize: groupSize)
+            }
             return DiTLinear(weight: w, bias: b, K: K, N: N)
         }
 

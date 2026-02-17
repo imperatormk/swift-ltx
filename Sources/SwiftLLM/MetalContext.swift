@@ -182,6 +182,15 @@ public final class BufferPool: @unchecked Sendable {
         free.removeAll()
     }
 
+    /// Trim free lists: keep at most 1 buffer per size to cap memory while allowing reuse.
+    public func trimFreeList() {
+        for (size, var list) in free {
+            if list.count > 1 {
+                free[size] = [list.removeLast()]
+            }
+        }
+    }
+
     /// Nuclear option: drop ALL buffers (active + free). Use between pipeline stages.
     /// Only buffers in the `keeping` list survive.
     public func releaseAll(keeping: [MTLBuffer] = []) {
