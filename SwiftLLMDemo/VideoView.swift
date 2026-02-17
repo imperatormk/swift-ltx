@@ -44,12 +44,15 @@ struct VideoView: View {
                         // Paths
                         #if os(macOS)
                         pathField("DiT model dir", text: $runner.ditPath)
+                        #endif
                         Toggle("Use T5 Encoder (custom prompt)", isOn: $runner.useT5Encoder)
                             .font(.system(size: 13, design: .monospaced))
                             .foregroundStyle(.white)
                         if runner.useT5Encoder {
+                            #if os(macOS)
                             pathField("T5 weights", text: $runner.t5WeightsPath)
                             pathField("Tokenizer", text: $runner.t5TokenizerPath)
+                            #endif
                             HStack {
                                 Text("Prompt:")
                                     .font(.system(size: 13, design: .monospaced))
@@ -59,8 +62,11 @@ struct VideoView: View {
                                     .font(.system(size: 13, design: .monospaced))
                             }
                         } else {
+                            #if os(macOS)
                             pathField("T5 embeddings", text: $runner.embeddingsPath)
+                            #endif
                         }
+                        #if os(macOS)
                         pathField("VAE weights", text: $runner.vaePath)
                         #endif
 

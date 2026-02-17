@@ -27,7 +27,7 @@ final class VideoRunner: ObservableObject {
     @Published var progress: (Int, Int)? = nil
 
     #if os(macOS)
-    @Published var ditPath = NSString(string: "~/Downloads/ltxv_dit_4bit.safetensors").expandingTildeInPath
+    @Published var ditPath = NSString(string: "~/Downloads/ltxv_dit_bf16.safetensors").expandingTildeInPath
     @Published var embeddingsPath = NSString(string: "~/Downloads/t5_embed_a_cat_walking_on_a_sunny_beach.safetensors").expandingTildeInPath
     @Published var vaePath = NSString(string: "~/Downloads/ltxv_vae_decoder_f16.safetensors").expandingTildeInPath
     @Published var upsamplerPath = NSString(string: "~/Downloads/ltxv-spatial-upscaler-0.9.8.safetensors").expandingTildeInPath
@@ -352,15 +352,6 @@ final class VideoRunner: ObservableObject {
                 pt = CFAbsoluteTimeGetCurrent()
                 let finalF16 = castF32toF16(pass2F32, count: pass2Count, shape: [1, latentC, nFrames, finalH, finalW])
                 updateLog(String(format: "[PERF] S4 cast_f32_to_f16: %.1fms", (CFAbsoluteTimeGetCurrent() - pt) * 1000))
-
-                // Save latents for quick VAE iteration
-                let latentSavePath = "/tmp/ltxv_pipeline_latents.safetensors"
-                let latentSavePathVAETab = "/tmp/mlx_vae_input_latents.safetensors"
-                try saveSafetensors(name: "latent", buffer: finalF16.buffer, dtype: .float16,
-                                    shape: finalF16.shape, to: URL(fileURLWithPath: latentSavePath))
-                try saveSafetensors(name: "latent", buffer: finalF16.buffer, dtype: .float16,
-                                    shape: finalF16.shape, to: URL(fileURLWithPath: latentSavePathVAETab))
-                updateLog("[SAVE] Latents saved to \(latentSavePath) + VAE tab path, shape=\(finalF16.shape)")
 
                 pt = CFAbsoluteTimeGetCurrent()
                 let denormed = vaeDecoder.denormalize(finalF16)
