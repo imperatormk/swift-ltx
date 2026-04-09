@@ -143,9 +143,16 @@ public final class BufferPool: @unchecked Sendable {
     private var active: [MTLBuffer] = []
     /// Free buffers by exact size.
     private var free: [Int: [MTLBuffer]] = [:]
+    private let lock = os_unfair_lock_t.allocate(capacity: 1)
+
+    public init() {
+        lock.initialize(to: os_unfair_lock())
+    }
 
     /// Get a buffer of at least `length` bytes.
     public func get(length: Int) -> MTLBuffer {
+        os_unfair_lock_lock(lock)
+        defer { os_unfair_lock_unlock(lock) }
         let size = max(length, 256)
         if var list = free[size], !list.isEmpty {
             let buf = list.removeLast()
@@ -160,6 +167,8 @@ public final class BufferPool: @unchecked Sendable {
 
     /// Recycle all active buffers back to free lists.
     public func reset() {
+        os_unfair_lock_lock(lock)
+        defer { os_unfair_lock_unlock(lock) }
         for buf in active {
             free[buf.length, default: []].append(buf)
         }
@@ -168,6 +177,8 @@ public final class BufferPool: @unchecked Sendable {
 
     /// Recycle all active buffers EXCEPT the given ones.
     public func reset(keeping: [MTLBuffer]) {
+        os_unfair_lock_lock(lock)
+        defer { os_unfair_lock_unlock(lock) }
         let keepSet = Set(keeping.map { ObjectIdentifier($0) })
         for buf in active {
             if keepSet.contains(ObjectIdentifier(buf)) { continue }
@@ -179,11 +190,15 @@ public final class BufferPool: @unchecked Sendable {
 
     /// Purge free lists to actually release GPU memory.
     public func purge() {
+        os_unfair_lock_lock(lock)
+        defer { os_unfair_lock_unlock(lock) }
         free.removeAll()
     }
 
     /// Trim free lists: keep at most 1 buffer per size to cap memory while allowing reuse.
     public func trimFreeList() {
+        os_unfair_lock_lock(lock)
+        defer { os_unfair_lock_unlock(lock) }
         for (size, var list) in free {
             if list.count > 1 {
                 free[size] = [list.removeLast()]
@@ -194,6 +209,8 @@ public final class BufferPool: @unchecked Sendable {
     /// Nuclear option: drop ALL buffers (active + free). Use between pipeline stages.
     /// Only buffers in the `keeping` list survive.
     public func releaseAll(keeping: [MTLBuffer] = []) {
+        os_unfair_lock_lock(lock)
+        defer { os_unfair_lock_unlock(lock) }
         let keepSet = Set(keeping.map { ObjectIdentifier($0) })
         active.removeAll { !keepSet.contains(ObjectIdentifier($0)) }
         free.removeAll()
@@ -201,9 +218,76 @@ public final class BufferPool: @unchecked Sendable {
 
     /// Debug: total bytes in active + free lists.
     public var stats: (active: Int, free: Int, activeCount: Int, freeCount: Int) {
+        os_unfair_lock_lock(lock)
+        defer { os_unfair_lock_unlock(lock) }
         let freeBytes = free.values.reduce(0) { $0 + $1.reduce(0) { $0 + $1.length } }
         let freeCount = free.values.reduce(0) { $0 + $1.count }
         let activeBytes = active.reduce(0) { $0 + $1.length }
         return (activeBytes, freeBytes, active.count, freeCount)
     }
+
+    deinit {
+        lock.deinitialize(count: 1)
+        lock.deallocate()
+    }
+}
+
+// MARK: - Weight Arena
+
+/// Bump-allocator for one DiT block's weights. Uses vm_allocate so vm_deallocate
+/// returns pages to the kernel immediately — no Metal buffer recycler caching.
+/// Usage: alloc → suballocate buffers → use in GPU batch → deallocate → pages gone.
+public final class WeightArena {
+    private var base: UnsafeMutableRawPointer?
+    private var capacity: Int = 0
+    private var offset: Int = 0
+    /// MTLBuffers wrapping arena slices — kept alive until deallocate().
+    private var buffers: [MTLBuffer] = []
+
+    public init() {}
+
+    /// Allocate `bytes` of VM and prepare arena. Must call before suballocating.
+    public func allocate(capacity: Int) {
+        precondition(base == nil, "WeightArena already allocated")
+        // Round up to page size
+        let pageSize = Int(getpagesize())
+        let pages = (capacity + pageSize - 1) / pageSize
+        let size = pages * pageSize
+        var addr: vm_address_t = 0
+        let kr = vm_allocate(mach_task_self_, &addr, vm_size_t(size), VM_FLAGS_ANYWHERE)
+        precondition(kr == KERN_SUCCESS, "vm_allocate failed: \(kr)")
+        base = UnsafeMutableRawPointer(bitPattern: UInt(addr))
+        self.capacity = size
+        self.offset = 0
+        self.buffers = []
+    }
+
+    /// Carve out a Metal buffer of `length` bytes from the arena.
+    /// The buffer's memory is owned by the arena — valid until deallocate().
+    public func get(length: Int, device: MTLDevice) -> MTLBuffer {
+        precondition(base != nil, "WeightArena not allocated")
+        // Align to 256 bytes (Metal requirement)
+        let aligned = (length + 255) & ~255
+        precondition(offset + aligned <= capacity, "WeightArena overflow: need \(offset+aligned), have \(capacity)")
+        let ptr = base!.advanced(by: offset)
+        offset += aligned
+        // makeBuffer(bytesNoCopy:) — Metal maps this memory, does NOT copy or own it
+        let buf = device.makeBuffer(bytesNoCopy: ptr, length: max(aligned, 256),
+                                    options: .storageModeShared, deallocator: nil)!
+        buffers.append(buf)
+        return buf
+    }
+
+    /// Return all pages to the kernel immediately. Invalidates all buffers.
+    public func deallocate() {
+        guard let b = base else { return }
+        // Drop MTLBuffer references first so Metal unregisters the address range
+        buffers.removeAll()
+        vm_deallocate(mach_task_self_, vm_address_t(UInt(bitPattern: b)), vm_size_t(capacity))
+        base = nil
+        capacity = 0
+        offset = 0
+    }
+
+    deinit { deallocate() }
 }

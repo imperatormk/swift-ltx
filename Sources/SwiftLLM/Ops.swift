@@ -932,6 +932,68 @@ public func conv3d(_ x: Tensor, weight: Tensor, bias: Tensor,
     return out
 }
 
+// ── Implicit GEMM Conv3D ──────────────────────────────────────────────────────
+// No im2col buffer: input patch addresses computed on-the-fly inside the kernel.
+// Threadgroup: 128 threads (4 SIMD groups), tile [32 output positions × 32 channels].
+// Memory: O(tile SRAM) only — no intermediate allocations that scale with T/H/W.
+public func conv3d_implicit(_ x: Tensor, weight: Tensor, bias: Tensor,
+                             B: Int, C_in: Int, D: Int, H: Int, W: Int,
+                             C_out: Int, kD: Int, kH: Int, kW: Int,
+                             sD: Int = 1, sH: Int = 1, sW: Int = 1,
+                             pD: Int = 0, pH: Int = 0, pW: Int = 0,
+                             into: MTLBuffer? = nil) -> Tensor {
+    let D_out = (D + 2*pD - kD) / sD + 1
+    let H_out = (H + 2*pH - kH) / sH + 1
+    let W_out = (W + 2*pW - kW) / sW + 1
+
+    // 1x1x1 pointwise: no benefit from implicit GEMM, use existing fast path
+    let isPointwise = kD == 1 && kH == 1 && kW == 1
+                   && sD == 1 && sH == 1 && sW == 1
+                   && pD == 0 && pH == 0 && pW == 0
+    if isPointwise {
+        return conv3d(x, weight: weight, bias: bias,
+                      B: B, C_in: C_in, D: D, H: H, W: W,
+                      C_out: C_out, kD: 1, kH: 1, kW: 1,
+                      into: into)
+    }
+
+    let K = C_in * kD * kH * kW
+    let M = B * D_out * H_out * W_out
+
+    let outBuf = into ?? MetalContext.shared.bufferPool.get(length: B * C_out * D_out * H_out * W_out * 2)
+    let out = Tensor(buffer: outBuf, shape: [B, C_out, D_out, H_out, W_out], dtype: .float16)
+
+    var params: [UInt32] = [
+        UInt32(C_in),
+        UInt32(D), UInt32(H), UInt32(W),
+        UInt32(C_out),
+        UInt32(D_out), UInt32(H_out), UInt32(W_out),
+        UInt32(kD), UInt32(kH), UInt32(kW),
+        UInt32(sD), UInt32(sH), UInt32(sW),
+        UInt32(pD), UInt32(pH), UInt32(pW),
+        UInt32(M), UInt32(K)
+    ]
+
+    // Dispatch: implicit_gemm_conv3d — TM=32, TN=32, TK=32, 4 SIMD groups (128 threads).
+    // Zero intermediate buffer — no im2col allocation, memory scales with tile only.
+    let pipe = KernelCache.shared.pipeline("implicit_gemm_conv3d")
+    // smem: A[32,32]+B[32,32] f16 = 4096B during K loop; reused as out_f[32,32] f32 = 4096B at store
+    let smemBytes = 32 * 32 * 4  // 4096 bytes
+    let gridW = (C_out + 31) / 32
+    let gridH = (M + 31) / 32
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(x.buffer,      offset: 0, index: 0)
+        enc.setBuffer(weight.buffer, offset: 0, index: 1)
+        enc.setBuffer(bias.buffer,   offset: 0, index: 2)
+        enc.setBuffer(out.buffer,    offset: 0, index: 3)
+        enc.setBytes(&params, length: params.count * 4, index: 4)
+        enc.setThreadgroupMemoryLength(smemBytes, index: 0)
+        enc.dispatchThreadgroups(MTLSize(width: gridW, height: gridH, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1))
+    }
+    return out
+}
 
 /// Pixel norm: x / sqrt(mean(x^2, dim=C) + eps). Input/Output: [B, C, D, H, W].
 public func pixelNorm3d(_ x: Tensor, B: Int, C: Int, spatialSize: Int, eps: Float = 1e-8) -> Tensor {
@@ -1195,6 +1257,48 @@ public func temporalSliceGPU(_ x: Tensor, B: Int, C: Int, D: Int, H: Int, W: Int
                            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
     return out
+}
+
+/// Extract D-range from [B, C, D, H, W] → [B, C, count, H, W]. Reuses temporal_slice kernel.
+public func temporalRangeGPU(_ x: Tensor, B: Int, C: Int, D: Int, H: Int, W: Int,
+                              from: Int, count: Int) -> Tensor {
+    let HW = H * W
+    let total = B * C * count * HW
+    let out = Tensor.empty([B, C, count, H, W], dtype: .float16)
+    var dIn = UInt32(D), dOut = UInt32(count), hw = UInt32(HW), f = UInt32(from)
+    let pipe = KernelCache.shared.pipeline("temporal_slice")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(x.buffer, offset: 0, index: 0)
+        enc.setBuffer(out.buffer, offset: 0, index: 1)
+        enc.setBytes(&dIn, length: 4, index: 2)
+        enc.setBytes(&dOut, length: 4, index: 3)
+        enc.setBytes(&hw, length: 4, index: 4)
+        enc.setBytes(&f, length: 4, index: 5)
+        enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+    return out
+}
+
+/// Write a D-slice [B, C, count, H, W] into output [B, C, D_out, H, W] at d_offset.
+/// Uses a simple copy kernel (no Metal kernel needed — just offset the buffer).
+/// Actually writes in-place by computing output offset directly.
+public func temporalWriteGPU(_ src: Tensor, into dst: Tensor,
+                              B: Int, C: Int, D_out: Int, H: Int, W: Int,
+                              dOffset: Int, count: Int) {
+    let HW = H * W
+    let total = B * C * count * HW
+    var params: [UInt32] = [UInt32(D_out), UInt32(HW), UInt32(dOffset), UInt32(count)]
+    let pipe = KernelCache.shared.pipeline("temporal_write")
+    MetalContext.shared.run { enc in
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(src.buffer, offset: 0, index: 0)
+        enc.setBuffer(dst.buffer, offset: 0, index: 1)
+        enc.setBytes(&params, length: params.count * 4, index: 2)
+        enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1),
+                           threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
 }
 
 /// Unpatchify 3D: [B, C*p*p, F, H, W] → [B, C, F, H*p, W*p] (patch_size_t=1)

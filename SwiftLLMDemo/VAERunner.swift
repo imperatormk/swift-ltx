@@ -11,7 +11,7 @@ final class VAERunner: ObservableObject {
     @Published var decodedImage: DecodedFrame?
 
     #if os(macOS)
-    @Published var modelPath = NSString(string: "~/Downloads/ltxv_vae_decoder_f16.safetensors").expandingTildeInPath
+    @Published var modelPath = NSString(string: "~/Models/SwiftLLM/ltxv_vae_decoder_f16.safetensors").expandingTildeInPath
     @Published var latentPath = "/tmp/mlx_vae_input_latents.safetensors"
     #else
     @Published var modelPath = {

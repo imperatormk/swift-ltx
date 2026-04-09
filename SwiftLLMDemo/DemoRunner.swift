@@ -26,7 +26,7 @@ final class DemoRunner: ObservableObject {
     @Published var useFastGEMM = true
     @Published var temperature: Float = 0.7
     #if os(macOS)
-    @Published var modelPath = "/Users/zimski/.cache/huggingface/hub/models--mlx-community--Llama-3.2-3B-Instruct-4bit/snapshots/7f0dc925e0d0afb0322d96f9255cfddf2ba5636e"
+    @Published var modelPath = NSString(string: "~/.cache/huggingface/hub/models--mlx-community--Llama-3.2-3B-Instruct-4bit/snapshots/7f0dc925e0d0afb0322d96f9255cfddf2ba5636e").expandingTildeInPath
     #else
     @Published var modelPath = {
         // Auto-detect model in Documents/model/

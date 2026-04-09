@@ -187,6 +187,17 @@ public class SafeTensorsIndex {
         return buf
     }
 
+    /// Read tensor into a pooled Metal buffer — allows pool.purge() to release physical pages promptly.
+    public func readTensorIntoPoolBuffer(_ name: String) -> MTLBuffer? {
+        guard let info = tensors[name] else { return nil }
+        let fd = open(url.path, O_RDONLY)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        let buf = MetalContext.shared.bufferPool.get(length: max(info.byteCount, 256))
+        _posixRead(fd: fd, offset: dataOffset + info.offset, dst: buf.contents(), count: info.byteCount)
+        return buf
+    }
+
     /// Read tensor into an existing destination pointer (for conversion workflows).
     /// Caller provides pre-allocated memory — no Metal buffer or Data allocated.
     public func readTensorRaw(_ name: String, into dst: UnsafeMutableRawPointer) -> Bool {

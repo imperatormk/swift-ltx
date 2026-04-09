@@ -1754,6 +1754,21 @@ public final class KernelCache: @unchecked Sendable {
         output[tid] = input[bc * D * HW + (from_offset + d_out) * HW + hw];
     }
 
+    // Write a D-slice [B*C, count, HW] into a larger output [B*C, D_out, HW] at d_offset.
+    kernel void temporal_write(
+        device const half* src   [[buffer(0)]],
+        device       half* dst   [[buffer(1)]],
+        constant     uint* p     [[buffer(2)]],  // [D_out, HW, d_offset, count]
+        uint tid [[thread_position_in_grid]])
+    {
+        uint D_out   = p[0], HW = p[1], d_off = p[2], count = p[3];
+        uint bc  = tid / (count * HW);
+        uint rem = tid % (count * HW);
+        uint d   = rem / HW;
+        uint hw  = rem % HW;
+        dst[bc * D_out * HW + (d_off + d) * HW + hw] = src[tid];
+    }
+
     // GELU approximate f32: reads f32, writes f32
     kernel void gelu_approximate_f32(
         device const float* x [[buffer(0)]],
@@ -2884,6 +2899,179 @@ public final class KernelCache: @unchecked Sendable {
         uint o_base = h * R * D + r * D;
         for (uint i = 0; i < d_count && i < 4; i++) {
             O[o_base + d_start + i] = half(o_acc[i] * inv_sum);
+        }
+    }
+
+    // ── Implicit GEMM Conv3D ──────────────────────────────────────────────────
+    // No im2col buffer. Computes conv3d as a tiled GEMM where input addresses
+    // are resolved on-the-fly.
+    //
+    // Tile: TM=32 output positions × TN=32 output channels per threadgroup.
+    // 4 SIMD groups × 32 lanes = 128 threads. K-tile=32.
+    //
+    // smem: A[32,32] f16 + B[32,32] f16 = 4096B during K-loop;
+    //       reused as out_f[32,32] float = 4096B during store.
+    //
+    // params: [C_in, D_in, H_in, W_in, C_out, D_out, H_out, W_out,
+    //          kD, kH, kW, sD, sH, sW, pD, pH, pW, M, K]
+    kernel void implicit_gemm_conv3d(
+        device const half*  input  [[buffer(0)]],
+        device const half*  weight [[buffer(1)]],
+        device const half*  bias   [[buffer(2)]],
+        device       half*  output [[buffer(3)]],
+        constant     uint*  params [[buffer(4)]],
+        uint2  tgid    [[threadgroup_position_in_grid]],
+        uint   simd_id [[simdgroup_index_in_threadgroup]],
+        uint   lane_id [[thread_index_in_simdgroup]],
+        threadgroup half*   smem   [[threadgroup(0)]])
+    {
+        const uint C_in  = params[0];
+        const uint D_in  = params[1], H_in  = params[2], W_in  = params[3];
+        const uint C_out = params[4];
+        const uint D_out = params[5], H_out = params[6], W_out = params[7];
+        const uint kD    = params[8], kH    = params[9], kW    = params[10];
+        const uint sD    = params[11], sH   = params[12], sW   = params[13];
+        const uint pD    = params[14], pH   = params[15], pW   = params[16];
+        const uint M     = params[17];
+        const uint K     = params[18];
+
+        const uint kSize   = kD * kH * kW;
+        const uint HW_in   = H_in * W_in;
+        const uint HW_out  = H_out * W_out;
+        const uint DHW_in  = D_in * HW_in;
+        const uint DHW_out = D_out * HW_out;
+
+        // TM=32, TN=32, 4 SIMD groups × 32 lanes = 128 threads. TK=32.
+        // Grid: ((C_out+31)/32, (M+31)/32, 1)
+        // smem: A[32,32] f16 + B[32,32] f16 = 4096B during K-loop;
+        //       reused as out_f[32,32] float = 4096B during store.
+        const uint tile_m   = tgid.y * 32;
+        const uint tile_n   = tgid.x * 32;
+        const uint flat_tid = simd_id * 32 + lane_id;
+
+        threadgroup half*  A_smem = smem;            // [32, 32] f16, row-major
+        threadgroup half*  B_smem = smem + 32 * 32;  // [32, 32] f16, row-major
+
+        // Each SIMD group owns rows [simd_id*8 .. simd_id*8+7] × all 32 N-cols.
+        // 4 accumulators per SIMD group, one per N-subtile of 8.
+        simdgroup_matrix<float, 8, 8> acc0(0), acc1(0), acc2(0), acc3(0);
+
+        // ── Precompute spatial coords for all 32 M-rows ────────────────────────
+        uint m_b[32], m_od[32], m_oh[32], m_ow[32];
+        bool m_valid[32];
+        for (uint r = 0; r < 32; r++) {
+            uint m = tile_m + r;
+            m_valid[r] = (m < M);
+            if (m_valid[r]) {
+                m_b[r]   = m / DHW_out;
+                uint rem = m % DHW_out;
+                m_od[r]  = rem / HW_out;
+                rem      = rem % HW_out;
+                m_oh[r]  = rem / W_out;
+                m_ow[r]  = rem % W_out;
+            }
+        }
+
+        // ── K loop, TK = 32 ──────────────────────────────────────────────────
+        for (uint k_start = 0; k_start < K; k_start += 32) {
+
+            // Load A [32, 32]: 128 threads × 8 elements each = 1024 total
+            for (uint i = flat_tid; i < 32 * 32; i += 128) {
+                uint row  = i / 32;
+                uint kcol = i % 32;
+                uint k    = k_start + kcol;
+                half val  = 0;
+                if (m_valid[row] && k < K) {
+                    uint ci  = k / kSize;
+                    uint kp  = k % kSize;
+                    uint fd  = kp / (kH * kW);
+                    uint kp2 = kp % (kH * kW);
+                    uint fh  = kp2 / kW;
+                    uint fw  = kp2 % kW;
+                    int d_in = int(m_od[row] * sD + fd) - int(pD);
+                    int h_in = int(m_oh[row] * sH + fh) - int(pH);
+                    int w_in = int(m_ow[row] * sW + fw) - int(pW);
+                    if (d_in >= 0 && uint(d_in) < D_in &&
+                        h_in >= 0 && uint(h_in) < H_in &&
+                        w_in >= 0 && uint(w_in) < W_in) {
+                        val = input[m_b[row] * C_in * DHW_in
+                                    + ci * DHW_in
+                                    + uint(d_in) * HW_in
+                                    + uint(h_in) * W_in
+                                    + uint(w_in)];
+                    }
+                }
+                A_smem[row * 32 + kcol] = val;
+            }
+
+            // Load B [32, 32]: lane `nc` loads 32 contiguous K-values for channel tile_n+nc.
+            // weight layout [C_out, K] → weight[co * K + k_start .. +31] is contiguous.
+            // Write column-major to smem: B_smem[kr, nc] = weight[tile_n+nc, k_start+kr].
+            {
+                uint co = tile_n + lane_id;
+                if (co < C_out) {
+                    device const half* wrow = weight + co * K + k_start;
+                    for (uint kr = 0; kr < 32; kr++) {
+                        B_smem[kr * 32 + lane_id] = (k_start + kr < K) ? wrow[kr] : half(0);
+                    }
+                } else {
+                    for (uint kr = 0; kr < 32; kr++) B_smem[kr * 32 + lane_id] = 0;
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Compute: each SIMD group handles rows [simd_id*8..+7] × all 32 N-cols.
+            // Unroll 4 k-subtiles of 8.
+            simdgroup_matrix<half, 8, 8> a0, a1, a2, a3, b;
+            simdgroup_load(a0, A_smem + simd_id * 8 * 32 + 0,  32);
+            simdgroup_load(a1, A_smem + simd_id * 8 * 32 + 8,  32);
+            simdgroup_load(a2, A_smem + simd_id * 8 * 32 + 16, 32);
+            simdgroup_load(a3, A_smem + simd_id * 8 * 32 + 24, 32);
+
+            simdgroup_load(b, B_smem + 0  * 32 + 0, 32); simdgroup_multiply_accumulate(acc0, a0, b, acc0);
+            simdgroup_load(b, B_smem + 8  * 32 + 0, 32); simdgroup_multiply_accumulate(acc0, a1, b, acc0);
+            simdgroup_load(b, B_smem + 16 * 32 + 0, 32); simdgroup_multiply_accumulate(acc0, a2, b, acc0);
+            simdgroup_load(b, B_smem + 24 * 32 + 0, 32); simdgroup_multiply_accumulate(acc0, a3, b, acc0);
+
+            simdgroup_load(b, B_smem + 0  * 32 + 8, 32); simdgroup_multiply_accumulate(acc1, a0, b, acc1);
+            simdgroup_load(b, B_smem + 8  * 32 + 8, 32); simdgroup_multiply_accumulate(acc1, a1, b, acc1);
+            simdgroup_load(b, B_smem + 16 * 32 + 8, 32); simdgroup_multiply_accumulate(acc1, a2, b, acc1);
+            simdgroup_load(b, B_smem + 24 * 32 + 8, 32); simdgroup_multiply_accumulate(acc1, a3, b, acc1);
+
+            simdgroup_load(b, B_smem + 0  * 32 + 16, 32); simdgroup_multiply_accumulate(acc2, a0, b, acc2);
+            simdgroup_load(b, B_smem + 8  * 32 + 16, 32); simdgroup_multiply_accumulate(acc2, a1, b, acc2);
+            simdgroup_load(b, B_smem + 16 * 32 + 16, 32); simdgroup_multiply_accumulate(acc2, a2, b, acc2);
+            simdgroup_load(b, B_smem + 24 * 32 + 16, 32); simdgroup_multiply_accumulate(acc2, a3, b, acc2);
+
+            simdgroup_load(b, B_smem + 0  * 32 + 24, 32); simdgroup_multiply_accumulate(acc3, a0, b, acc3);
+            simdgroup_load(b, B_smem + 8  * 32 + 24, 32); simdgroup_multiply_accumulate(acc3, a1, b, acc3);
+            simdgroup_load(b, B_smem + 16 * 32 + 24, 32); simdgroup_multiply_accumulate(acc3, a2, b, acc3);
+            simdgroup_load(b, B_smem + 24 * 32 + 24, 32); simdgroup_multiply_accumulate(acc3, a3, b, acc3);
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // ── Store: reuse smem as float[32,32], scatter to NCHW output ────────
+        threadgroup float* out_f = (threadgroup float*)smem;
+        simdgroup_store(acc0, out_f + simd_id * 8 * 32 + 0,  32);
+        simdgroup_store(acc1, out_f + simd_id * 8 * 32 + 8,  32);
+        simdgroup_store(acc2, out_f + simd_id * 8 * 32 + 16, 32);
+        simdgroup_store(acc3, out_f + simd_id * 8 * 32 + 24, 32);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = flat_tid; i < 32 * 32; i += 128) {
+            uint r  = i / 32;
+            uint c  = i % 32;
+            uint co = tile_n + c;
+            if (!m_valid[r] || co >= C_out) continue;
+            float val = out_f[r * 32 + c] + float(bias[co]);
+            uint out_idx = m_b[r] * C_out * DHW_out
+                         + co * DHW_out
+                         + m_od[r] * HW_out
+                         + m_oh[r] * W_out
+                         + m_ow[r];
+            output[out_idx] = half(val);
         }
     }
     """

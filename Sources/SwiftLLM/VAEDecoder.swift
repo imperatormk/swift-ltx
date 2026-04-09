@@ -1,4 +1,20 @@
 // LTX-Video VAE Decoder — pure Swift + Metal.
+// Set to true to enable per-tile debug logs + [MEM] stats in perf callback (adds overhead).
+private let vaeDebugLogs = true
+
+// MARK: - Memory config
+// Tile target bytes for each tiled operation. Raise on devices with more RAM → fewer tiles → faster.
+// WARNING: resblock peak is always 2× full activation (x + conv1Out both full-D) regardless of tile size.
+// For block 6 at C=128, D=73, H=160, W=160: full activation = 478MB, peak ≥ 956MB + overhead.
+private let vaeResTileBytes  = 50 * 1024 * 1024   // resblock P1/P2 D-tile target
+private let vaeDtsTileBytes  = 50 * 1024 * 1024   // DepthToSpace conv tile target
+private let vaeTailTileBytes = 50 * 1024 * 1024   // tail pixnorm/adaln tile target
+
+private func memTag() -> String {
+    guard vaeDebugLogs else { return "" }
+    let s = PeakMemoryTracker.shared.sample()
+    return " [MEM] Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB Proc=\(s.current/1048576)MB Peak=\(s.peak/1048576)MB"
+}
 // Im2col+GEMM for small C_in, gather-GEMM for large C_in. Fits in ~1.4GB on iPhone.
 //
 // Architecture (from actual safetensors weights):
@@ -148,7 +164,7 @@ enum VAEBlockDesc {
     case depthToSpace(idx: Int, C_in: Int, C_out: Int)
 }
 
-public class VAEDecoder {
+public class VAEDecoder: @unchecked Sendable {
     let convIn: Conv3DWeight        // 128 → 1024
     let blockDescs: [VAEBlockDesc]  // lazy — loaded on demand during decode
     let convOut: Conv3DWeight       // 128 → 48
@@ -450,16 +466,16 @@ public class VAEDecoder {
 
             switch desc {
             case .midBlock(let idx, let ch, let teDim, let numRes):
-                step("up_block \(idx): MidBlock(\(C), \(numRes) res), spatial \(D)x\(H)x\(W) [MEM] Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB Proc=\(PeakMemoryTracker.shared.sample().current/1048576)MB Peak=\(PeakMemoryTracker.shared.peak/1048576)MB")
+                step("up_block \(idx): MidBlock(\(C), \(numRes) res), spatial \(D)x\(H)x\(W)\(memTag())")
                 let midBlock = weights as! UNetMidBlockWeights
                 x = runMidBlock(x, weights: midBlock, B: B, C: C, D: D, H: H, W: W,
                               timestep: tsTensor, scaledTimestep: scaledTimestep, perf: { log?("[PERF] " + $0) })
                 pool.reset(keeping: [x.buffer]); pool.purge()
-                step("up_block \(idx) done [MEM] Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB Proc=\(PeakMemoryTracker.shared.sample().current/1048576)MB Peak=\(PeakMemoryTracker.shared.peak/1048576)MB")
+                step("up_block \(idx) done\(memTag())")
                 if debug { step(tensorStats(x, label: "up_block_\(idx)_out")) }
 
             case .depthToSpace(let idx, _, let C_out):
-                step("up_block \(idx): DepthToSpace(\(C)→\(C_out)), spatial \(D)x\(H)x\(W) [MEM] Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB Proc=\(PeakMemoryTracker.shared.sample().current/1048576)MB Peak=\(PeakMemoryTracker.shared.peak/1048576)MB")
+                step("up_block \(idx): DepthToSpace(\(C)→\(C_out)), spatial \(D)x\(H)x\(W)\(memTag())")
                 let dtsBlock = weights as! DepthToSpaceWeights
                 x = runDepthToSpaceUpsample(x, weights: dtsBlock, B: B, C: C, D: D, H: H, W: W, causal: false, perf: { log?("[PERF] " + $0) })
                 let (p1, p2, p3) = dtsBlock.stride
@@ -473,24 +489,36 @@ public class VAEDecoder {
                 W = W * p3
                 C = newC
                 pool.reset(keeping: [x.buffer]); pool.purge()
-                step("up_block \(idx) done [MEM] Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB Proc=\(PeakMemoryTracker.shared.sample().current/1048576)MB Peak=\(PeakMemoryTracker.shared.peak/1048576)MB")
+                step("up_block \(idx) done\(memTag())")
                 if debug { step(tensorStats(x, label: "up_block_\(idx)_out")) }
             }
         }
 
-        // Tail ops: pixnorm → adaln → silu (batched together)
+        // Tail ops: pixnorm → adaln → silu, tiled over D to avoid 686MB output spike
         step("pixel_norm C=\(C), spatial \(D)x\(H)x\(W)")
-        let spatialSize = D * H * W
-        ctx.beginBatch()
-        x = pixelNorm3d(x, B: B, C: C, spatialSize: spatialSize)
-        x = applyLastAdaLN(x, B: B, C: C, spatialSize: spatialSize,
-                          timestep: tsTensor, scaledTimestep: scaledTimestep)
-        x = silu(x)
-        ctx.endBatch()
+        pool.reset(keeping: [x.buffer, tsBuf]); pool.purge()
+        let tailBytesPerFrame = B * C * H * W * 2
+        let tailTile = max(1, min(D, vaeTailTileBytes / max(tailBytesPerFrame, 1)))
+        let tailOutBuf = MetalContext.shared.device.makeBuffer(length: B * C * D * H * W * 2, options: .storageModeShared)!
+        let tailOut = Tensor(buffer: tailOutBuf, shape: [B, C, D, H, W], dtype: .float16)
+        var td = 0
+        while td < D {
+            let tc = min(tailTile, D - td)
+            var s = temporalRangeGPU(x, B: B, C: C, D: D, H: H, W: W, from: td, count: tc)
+            s = pixelNorm3d(s, B: B, C: C, spatialSize: tc * H * W)
+            s = applyLastAdaLN(s, B: B, C: C, spatialSize: tc * H * W,
+                               timestep: tsTensor, scaledTimestep: scaledTimestep)
+            s = silu(s)
+            temporalWriteGPU(s, into: tailOut, B: B, C: C, D_out: D, H: H, W: W, dOffset: td, count: tc)
+            pool.reset(keeping: [x.buffer, tsBuf, tailOutBuf]); pool.purge()
+            td += tc
+        }
+        pool.reset(keeping: [tailOutBuf, tsBuf]); pool.purge()
+        x = tailOut
         if debug {
             step(tensorStats(x, label: "after_silu"))
         }
-        step("last AdaLN + silu done [MEM] Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB Proc=\(PeakMemoryTracker.shared.sample().current/1048576)MB Peak=\(PeakMemoryTracker.shared.peak/1048576)MB")
+        step("last AdaLN + silu done\(memTag())")
 
         // conv_out
         step("conv_out: \(C)→48, 3x3x3, spatial \(D)x\(H)x\(W)")
@@ -500,13 +528,12 @@ public class VAEDecoder {
         if debug { step(tensorStats(x, label: "after_conv_out")) }
 
         // unpatchify: [B, 48, F, H, W] → [B, 3, F, H*4, W*4]
-        step("unpatchify [MEM] Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB Proc=\(PeakMemoryTracker.shared.sample().current/1048576)MB Peak=\(PeakMemoryTracker.shared.peak/1048576)MB")
+        step("unpatchify\(memTag())")
         x = unpatchify3d(x, B: B, C_out: 3, F: D, H_in: H, W_in: W, patchSize: patchSize)
         pool.reset(keeping: [x.buffer]); pool.purge()
         if debug { step(tensorStats(x, label: "final_output")) }
 
-        let finalMem = PeakMemoryTracker.shared.sample()
-        log?("decode complete, shape \(x.shape) [MEM] Metal=\(MetalContext.shared.device.currentAllocatedSize/1048576)MB Proc=\(finalMem.current/1048576)MB PEAK=\(finalMem.peak/1048576)MB")
+        log?("decode complete, shape \(x.shape)\(memTag())")
         return x
     }
 
@@ -553,11 +580,11 @@ public class VAEDecoder {
 
         // Spatial padding is built into the conv3d kernel via pH, pW
         let spatialPad = conv.kH / 2  // kernel_size=3 → padding=1
-        return conv3d(padded, weight: conv.weight, bias: conv.bias,
-                     B: B, C_in: C_in, D: D_padded, H: H, W: W,
-                     C_out: conv.C_out, kD: conv.kD, kH: conv.kH, kW: conv.kW,
-                     sD: conv.sD, sH: conv.sH, sW: conv.sW,
-                     pD: 0, pH: spatialPad, pW: spatialPad, into: into)
+        return conv3d_implicit(padded, weight: conv.weight, bias: conv.bias,
+                               B: B, C_in: C_in, D: D_padded, H: H, W: W,
+                               C_out: conv.C_out, kD: conv.kD, kH: conv.kH, kW: conv.kW,
+                               sD: conv.sD, sH: conv.sH, sW: conv.sW,
+                               pD: 0, pH: spatialPad, pW: spatialPad, into: into)
     }
 
     /// Pad input for causal/non-causal conv3d, returning the padded tensor.
@@ -589,74 +616,160 @@ public class VAEDecoder {
     private func runMidBlock(_ x: Tensor, weights: UNetMidBlockWeights, B: Int, C: Int, D: Int, H: Int, W: Int,
                             timestep: Tensor, scaledTimestep: Float,
                             perf: ((String) -> Void)? = nil) -> Tensor {
-        // Compute timestep embedding: sinusoidal(256) → linear1 → silu → linear2
         let tsEmb = computeTimestepEmbedding(timestep, embedder: weights.timeEmbedder, B: B,
                                              scaledTimestep: scaledTimestep)
 
         let pool = MetalContext.shared.bufferPool
-        // Pre-allocate ONE scratch buffer shared across all resblocks for conv outputs
-        let convOutBytes = B * C * D * H * W * 2
-        let scratch = MetalContext.shared.device.makeBuffer(length: convOutBytes, options: .storageModeShared)!
+
+        // Choose D-tile size based on spatial footprint to cap peak memory.
+        // Each resblock needs ~3× the full-D activation live simultaneously.
+        // Target: keep live activations under ~400MB.
+        // activation bytes = B * C * D * H * W * 2
+        let actBytes = B * C * D * H * W * 2
+        let dTile: Int
+        // Always tile — conv1OutBuf (full D) + x (full D) are unavoidable, keep slices tiny
+        let bytesPerFrame = B * C * H * W * 2
+        dTile = max(1, min(D, vaeResTileBytes / max(bytesPerFrame, 1)))
+
+        // Scratch buffer sized for one D-tile (tiled path) or full D (untiled path)
+        let scratchD = dTile < D ? dTile : D
+        let scratch = MetalContext.shared.device.makeBuffer(
+            length: B * C * scratchD * H * W * 2, options: .storageModeShared)!
+
         let blockStart = CFAbsoluteTimeGetCurrent()
         var h = x
         for (i, resBlock) in weights.resBlocks.enumerated() {
             let t0 = CFAbsoluteTimeGetCurrent()
-            h = runResBlock(h, weights: resBlock, B: B, C: C, D: D, H: H, W: W, tsEmb: tsEmb, scratch: scratch)
+            h = runResBlock(h, weights: resBlock, B: B, C: C, D: D, H: H, W: W,
+                           tsEmb: tsEmb, scratch: scratch, dTile: dTile, perf: perf)
             pool.reset(keeping: [h.buffer, tsEmb.buffer, scratch])
             pool.purge()
             let dt = (CFAbsoluteTimeGetCurrent() - t0) * 1000
             let wall = (CFAbsoluteTimeGetCurrent() - blockStart) * 1000
-            let (memCur, memPeak) = PeakMemoryTracker.shared.sample()
-            perf?(String(format: "  res%d: %.1fms [wall=%.1fms] [MEM] Metal=%dMB Proc=%dMB Peak=%dMB", i, dt, wall,
-                         MetalContext.shared.device.currentAllocatedSize / 1048576, memCur / 1048576, memPeak / 1048576))
+            perf?(String(format: "  res%d: %.1fms [wall=%.1fms]", i, dt, wall) + memTag())
         }
-        // Free scratch explicitly — don't keep it in pool
         return h
     }
 
     private func runResBlock(_ x: Tensor, weights: ResBlockWeights, B: Int, C: Int, D: Int, H: Int, W: Int,
-                            tsEmb: Tensor, scratch: MTLBuffer? = nil) -> Tensor {
+                            tsEmb: Tensor, scratch: MTLBuffer? = nil, dTile: Int = Int.max,
+                            perf: ((String) -> Void)? = nil) -> Tensor {
+        let pool = MetalContext.shared.bufferPool
+
+        // AdaLN scale/shift — computed once for full tensor (cheap, no spatial dep on D)
+        let (scale1, shift1, scale2, shift2) = computeAdaLN(tsEmb, table: weights.scaleShiftTable, B: B, C: C)
+
+        // If no tiling needed, run the original full-D path
+        if dTile >= D {
+            return runResBlockFull(x, weights: weights, B: B, C: C, D: D, H: H, W: W,
+                                   tsEmb: tsEmb, scale1: scale1, shift1: shift1,
+                                   scale2: scale2, shift2: shift2, scratch: scratch)
+        }
+
+        // ── Tiled path ──────────────────────────────────────────────────────
+        // Key insight: norm (pixel_norm + AdaLN + silu) is per-pixel-channel —
+        // it works identically on any D-slice. So we tile EVERYTHING:
+        // for each tile: extract x-slice → norm → pad → conv → write to out.
+        // Peak live buffers per tile: x (full, read-only) + sliceNorm + slicePadded + sliceOut
+        // = D*full + dTile*slices ≈ x_full + 3×dTile_slice. Much better.
+        //
+        // Conv2 needs conv1's full output for norm2 — so we do a two-pass approach:
+        // Pass 1: x → norm1 → conv1 → conv1Out (full D, but written slice by slice)
+        // Pass 2: conv1Out → norm2 → conv2 → residual add (slice by slice, no full buffer needed)
+
+        let convOutBytes = B * C * D * H * W * 2
+        let conv1OutBuf = MetalContext.shared.device.makeBuffer(length: convOutBytes, options: .storageModeShared)!
+        let conv1Out = Tensor(buffer: conv1OutBuf, shape: [B, C, D, H, W], dtype: .float16)
+
+        let spatialPad1 = weights.conv1.kH / 2
+        if vaeDebugLogs { perf?("[RES-P1] C=\(C) D=\(D) dTile=\(dTile)") }
+        var d = 0
+        while d < D {
+            let tileCount = min(dTile, D - d)
+            let isLastTile1 = (d + tileCount >= D)
+            let srcFrom = max(0, d - 1)
+            let srcTo   = min(D, d + tileCount + 1)
+            let srcCount = srcTo - srcFrom
+            let xSlice1 = temporalRangeGPU(x, B: B, C: C, D: D, H: H, W: W, from: srcFrom, count: srcCount)
+            var normSlice = pixelNormScaleShiftSilu(xSlice1, scale: scale1, shift: shift1, B: B, C: C, spatialSize: srcCount * H * W)
+            pool.reset(keeping: [x.buffer, conv1OutBuf, scale2.buffer, shift2.buffer, tsEmb.buffer, normSlice.buffer]); pool.purge()
+            var sliceD = srcCount
+            if srcFrom == 0  { normSlice = causalPad(normSlice, B: B, C: C, D: sliceD, H: H, W: W, pad: 1); sliceD += 1 }
+            if isLastTile1   { normSlice = causalPadBack(normSlice, B: B, C: C, D: sliceD, H: H, W: W, pad: 1); sliceD += 1 }
+            let sliceOut = conv3d_implicit(normSlice, weight: weights.conv1.weight, bias: weights.conv1.bias,
+                                           B: B, C_in: C, D: sliceD, H: H, W: W, C_out: C,
+                                           kD: weights.conv1.kD, kH: weights.conv1.kH, kW: weights.conv1.kW,
+                                           pH: spatialPad1, pW: spatialPad1)
+            let convDout1 = (sliceD - weights.conv1.kD) / weights.conv1.sD + 1
+            if vaeDebugLogs { perf?("  [RES-P1] d=\(d) srcFrom=\(srcFrom) srcCount=\(srcCount) sliceD=\(sliceD) convDout1=\(convDout1) -> dOffset=\(d)") }
+            temporalWriteGPU(sliceOut, into: conv1Out, B: B, C: C, D_out: D, H: H, W: W, dOffset: d, count: convDout1)
+            pool.reset(keeping: [x.buffer, conv1OutBuf, scale2.buffer, shift2.buffer, tsEmb.buffer]); pool.purge()
+            d += tileCount
+        }
+
+        // Pass 2: write output back into x.buffer (residual read before write — safe)
+        let outTensor = Tensor(buffer: x.buffer, shape: [B, C, D, H, W], dtype: .float16)
+        let spatialPad2 = weights.conv2.kH / 2
+        if vaeDebugLogs { perf?("[RES-P2] C=\(C) D=\(D) dTile=\(dTile)") }
+        d = 0
+        while d < D {
+            let tileCount = min(dTile, D - d)
+            let isLastTile2 = (d + tileCount >= D)
+            let srcFrom = max(0, d - 1)
+            let srcTo   = min(D, d + tileCount + 1)
+            let srcCount = srcTo - srcFrom
+            let c1Slice = temporalRangeGPU(conv1Out, B: B, C: C, D: D, H: H, W: W, from: srcFrom, count: srcCount)
+            var norm2Slice = pixelNormScaleShiftSilu(c1Slice, scale: scale2, shift: shift2, B: B, C: C, spatialSize: srcCount * H * W)
+            pool.reset(keeping: [x.buffer, conv1OutBuf, tsEmb.buffer, norm2Slice.buffer]); pool.purge()
+            var sliceD = srcCount
+            if srcFrom == 0  { norm2Slice = causalPad(norm2Slice, B: B, C: C, D: sliceD, H: H, W: W, pad: 1); sliceD += 1 }
+            if isLastTile2   { norm2Slice = causalPadBack(norm2Slice, B: B, C: C, D: sliceD, H: H, W: W, pad: 1); sliceD += 1 }
+            let conv2Slice = conv3d_implicit(norm2Slice, weight: weights.conv2.weight, bias: weights.conv2.bias,
+                                             B: B, C_in: C, D: sliceD, H: H, W: W, C_out: C,
+                                             kD: weights.conv2.kD, kH: weights.conv2.kH, kW: weights.conv2.kW,
+                                             pH: spatialPad2, pW: spatialPad2)
+            let convDout2 = (sliceD - weights.conv2.kD) / weights.conv2.sD + 1
+            if vaeDebugLogs { perf?("  [RES-P2] d=\(d) srcFrom=\(srcFrom) srcCount=\(srcCount) sliceD=\(sliceD) convDout2=\(convDout2) -> dOffset=\(d)") }
+            // Read residual from x BEFORE writing into x.buffer via outTensor
+            let xSlice = temporalRangeGPU(x, B: B, C: C, D: D, H: H, W: W, from: d, count: convDout2)
+            let resSlice = elemAdd(xSlice, conv2Slice)
+            pool.reset(keeping: [x.buffer, conv1OutBuf, tsEmb.buffer, resSlice.buffer]); pool.purge()
+            temporalWriteGPU(resSlice, into: outTensor, B: B, C: C, D_out: D, H: H, W: W, dOffset: d, count: convDout2)
+            pool.reset(keeping: [x.buffer, conv1OutBuf, tsEmb.buffer]); pool.purge()
+            d += tileCount
+        }
+
+        return outTensor
+    }
+
+    /// Full-D resblock (no tiling) — original path.
+    private func runResBlockFull(_ x: Tensor, weights: ResBlockWeights, B: Int, C: Int, D: Int, H: Int, W: Int,
+                                 tsEmb: Tensor, scale1: Tensor, shift1: Tensor,
+                                 scale2: Tensor, shift2: Tensor, scratch: MTLBuffer?) -> Tensor {
         let pool = MetalContext.shared.bufferPool
         let spatialSize = D * H * W
-
-        // Pre-allocate scratch buffer for conv outputs to avoid peak = x + h + conv_out
-        // With scratch, conv writes into scratch while h is freed by pool during conv
-        let convOutBytes = B * C * D * H * W * 2  // C_in == C_out for resblocks
+        let convOutBytes = B * C * D * H * W * 2
         let scratchBuf = scratch ?? MetalContext.shared.device.makeBuffer(length: convOutBytes, options: .storageModeShared)!
         var h = x
 
-        // AdaLN: compute all 4 scale/shift values
-        let (scale1, shift1, scale2, shift2) = computeAdaLN(tsEmb, table: weights.scaleShiftTable, B: B, C: C)
-
-        // Fused: pixel_norm + scale_shift + silu
         h = pixelNormScaleShiftSilu(h, scale: scale1, shift: shift1, B: B, C: C, spatialSize: spatialSize)
-
-        // conv1: pad first, free norm output, then conv into scratch
         var padded = causalPadForConv(h, conv: weights.conv1, B: B, C_in: C, D: D, H: H, W: W, causal: false)
-        // Free h (norm output) — padded has its own copy
         pool.reset(keeping: [x.buffer, padded.buffer, scratchBuf, scale2.buffer, shift2.buffer, tsEmb.buffer]); pool.purge()
         let spatialPad1 = weights.conv1.kH / 2
-        h = conv3d(padded, weight: weights.conv1.weight, bias: weights.conv1.bias,
-                   B: B, C_in: C, D: padded.shape[2], H: H, W: W,
-                   C_out: C, kD: weights.conv1.kD, kH: weights.conv1.kH, kW: weights.conv1.kW,
-                   pH: spatialPad1, pW: spatialPad1, into: scratchBuf)
-        // h now points to scratchBuf. Free padded.
+        h = conv3d_implicit(padded, weight: weights.conv1.weight, bias: weights.conv1.bias,
+                            B: B, C_in: C, D: padded.shape[2], H: H, W: W,
+                            C_out: C, kD: weights.conv1.kD, kH: weights.conv1.kH, kW: weights.conv1.kW,
+                            pH: spatialPad1, pW: spatialPad1, into: scratchBuf)
         pool.reset(keeping: [x.buffer, h.buffer, scale2.buffer, shift2.buffer, tsEmb.buffer]); pool.purge()
-
-        // Fused: pixel_norm + scale_shift + silu (norm2)
         h = pixelNormScaleShiftSilu(h, scale: scale2, shift: shift2, B: B, C: C, spatialSize: spatialSize)
-
-        // conv2: pad first, free norm output, then conv into scratch
         padded = causalPadForConv(h, conv: weights.conv2, B: B, C_in: C, D: D, H: H, W: W, causal: false)
         pool.reset(keeping: [x.buffer, padded.buffer, scratchBuf, tsEmb.buffer]); pool.purge()
         let spatialPad2 = weights.conv2.kH / 2
-        h = conv3d(padded, weight: weights.conv2.weight, bias: weights.conv2.bias,
-                   B: B, C_in: C, D: padded.shape[2], H: H, W: W,
-                   C_out: C, kD: weights.conv2.kD, kH: weights.conv2.kH, kW: weights.conv2.kW,
-                   pH: spatialPad2, pW: spatialPad2, into: scratchBuf)
+        h = conv3d_implicit(padded, weight: weights.conv2.weight, bias: weights.conv2.bias,
+                            B: B, C_in: C, D: padded.shape[2], H: H, W: W,
+                            C_out: C, kD: weights.conv2.kD, kH: weights.conv2.kH, kW: weights.conv2.kW,
+                            pH: spatialPad2, pW: spatialPad2, into: scratchBuf)
         pool.reset(keeping: [x.buffer, h.buffer, tsEmb.buffer]); pool.purge()
-
-        // residual
         h = elemAdd(x, h)
         return h
     }
@@ -677,47 +790,104 @@ public class VAEDecoder {
             let newH = H * p2
             let newW = W * p3
 
-            // Skip path first: pixel_shuffle(x) → repeat → temporal slice
-            var x_repeated = pixelShuffle3d(x, B: B, C_out: skipC, D_in: D, H_in: H, W_in: W,
-                                           p1: p1, p2: p2, p3: p3)
-            if numRepeat > 1 {
-                let tmp = x_repeated
-                x_repeated = repeatChannels(tmp, B: B, C: skipC, spatialSize: newD * newH * newW, repeats: numRepeat)
-                // tmp can be freed now
-            }
-            if p1 == 2 {
-                let tmp = x_repeated
-                x_repeated = temporalSlice(tmp, B: B, C: skipC * numRepeat, D: newD, H: newH, W: newW, from: 1)
-            }
-            // Free intermediates, keep x (needed for conv) and x_repeated (needed for add)
-            pool.reset(keeping: [x.buffer, x_repeated.buffer]); pool.purge()
-
-            // Conv path: conv → pixel_shuffle → temporal slice
-            var t0 = CFAbsoluteTimeGetCurrent()
-            var h = causalConv3d(x, conv: weights.conv, B: B, C_in: C, D: D, H: H, W: W, causal: causal)
-            perf?(String(format: "  dts_conv(%d→%d): %.1fms [MEM] Metal=%dMB Proc=%dMB Peak=%dMB", C, weights.conv.C_out, (CFAbsoluteTimeGetCurrent() - t0) * 1000, MetalContext.shared.device.currentAllocatedSize / 1048576, PeakMemoryTracker.shared.sample().current / 1048576, PeakMemoryTracker.shared.peak / 1048576))
-            // x no longer needed
-            pool.reset(keeping: [h.buffer, x_repeated.buffer]); pool.purge()
-
+            // Conv path + skip path fused per tile to avoid full-D buffers.
+            // Peak per tile: x (full, read-only) + xSlice + convSlice + shuffled + skipSlice + outSlice
             let convOutC = weights.conv.C_out
-            t0 = CFAbsoluteTimeGetCurrent()
-            let tmp = h
-            h = pixelShuffle3d(tmp, B: B, C_out: convOutC / prodStride, D_in: D, H_in: H, W_in: W,
-                              p1: p1, p2: p2, p3: p3)
-            perf?(String(format: "  dts_shuffle: %.1fms", (CFAbsoluteTimeGetCurrent() - t0) * 1000))
-            pool.reset(keeping: [h.buffer, x_repeated.buffer]); pool.purge()
+            let spatialPadDTS = weights.conv.kH / 2
+            let shuffleC = convOutC / prodStride  // = skipC * numRepeat
+            let outDfull = p1 == 2 ? newD - 1 : newD
+            let outBytes = B * shuffleC * outDfull * newH * newW * 2
+            let outBuf = MetalContext.shared.device.makeBuffer(length: outBytes, options: .storageModeShared)!
+            let outTensor = Tensor(buffer: outBuf, shape: [B, shuffleC, outDfull, newH, newW], dtype: .float16)
 
-            if p1 == 2 {
-                let tmp2 = h
-                h = temporalSlice(tmp2, B: B, C: convOutC / prodStride, D: newD, H: newH, W: newW, from: 1)
-                pool.reset(keeping: [h.buffer, x_repeated.buffer]); pool.purge()
+            // Choose DTS tile size: target ~150MB per conv slice
+            let dtsBytesPerFrame = B * C * H * W * 2
+            let dtsTile = max(1, min(D, vaeDtsTileBytes / max(dtsBytesPerFrame * convOutC / C, 1)))
+
+            var t0 = CFAbsoluteTimeGetCurrent()
+            if vaeDebugLogs { perf?("[DTS] C=\(C) D=\(D) p1=\(p1) dtsTile=\(dtsTile) outDfull=\(outDfull) shuffleC=\(shuffleC) skipC=\(skipC) numRepeat=\(numRepeat)") }
+            var dOff = 0  // output frame offset (in shuffled+sliced space)
+            var d = 0
+            while d < D {
+                let tileCount = min(dtsTile, D - d)
+                let isLastTile = (d + tileCount >= D)
+
+                // ── Conv branch ──────────────────────────────────────────
+                let srcFrom = max(0, d - 1)
+                let srcTo   = min(D, d + tileCount + 1)
+                let srcCount = srcTo - srcFrom
+                var xSlice = temporalRangeGPU(x, B: B, C: C, D: D, H: H, W: W, from: srcFrom, count: srcCount)
+                var sliceD = srcCount
+                if srcFrom == 0 { xSlice = causalPad(xSlice, B: B, C: C, D: sliceD, H: H, W: W, pad: 1); sliceD += 1 }
+                if isLastTile   { xSlice = causalPadBack(xSlice, B: B, C: C, D: sliceD, H: H, W: W, pad: 1); sliceD += 1 }
+                let convSlice = conv3d_implicit(xSlice, weight: weights.conv.weight, bias: weights.conv.bias,
+                                               B: B, C_in: C, D: sliceD, H: H, W: W, C_out: convOutC,
+                                               kD: weights.conv.kD, kH: weights.conv.kH, kW: weights.conv.kW,
+                                               pH: spatialPadDTS, pW: spatialPadDTS)
+                let convDout = (sliceD - weights.conv.kD) / weights.conv.sD + 1
+                pool.reset(keeping: [x.buffer, outBuf, convSlice.buffer]); pool.purge()
+                var shuffled = pixelShuffle3d(convSlice, B: B, C_out: shuffleC, D_in: convDout, H_in: H, W_in: W,
+                                             p1: p1, p2: p2, p3: p3)
+                pool.reset(keeping: [x.buffer, outBuf, shuffled.buffer]); pool.purge()
+                // convDout may be > tileCount due to halo; clamp to tileCount * p1 output frames.
+                // The extra frames come from the left halo (frame d-1) that was included for conv correctness
+                // but whose output belongs to the previous tile.
+                let maxOutFrames = tileCount * p1
+                let dropFront = convDout * p1 - maxOutFrames  // frames to drop from front of shuffled (halo output)
+                var outFrames = maxOutFrames
+                if vaeDebugLogs { perf?("  [DTS-CONV] d=\(d) srcFrom=\(srcFrom) srcCount=\(srcCount) sliceD=\(sliceD) convDout=\(convDout) dropFront=\(dropFront) outFrames=\(outFrames) dOff=\(dOff)") }
+                if dropFront > 0 || (p1 == 2 && d == 0) {
+                    let dropTotal = dropFront + (p1 == 2 && d == 0 ? 1 : 0)
+                    let tmp2 = shuffled
+                    shuffled = temporalSlice(tmp2, B: B, C: shuffleC, D: convDout * p1, H: newH, W: newW, from: dropTotal)
+                    if p1 == 2 && d == 0 { outFrames -= 1 }
+                    pool.reset(keeping: [x.buffer, outBuf, shuffled.buffer]); pool.purge()
+                    if vaeDebugLogs { perf?("  [DTS-CONV] dropped \(dropTotal) frames from front, outFrames now=\(outFrames)") }
+                }
+
+                // ── Skip branch for this tile ────────────────────────────
+                // Non-tiled reference: skip = pixelShuffle(x)[1..] (drop frame 0, same as conv).
+                // Output position k uses skip frame k+1, which comes from input frame (k+1)/p1.
+                let skipInFrom  = (dOff + 1) / p1
+                let skipInLast  = (dOff + outFrames) / p1
+                let skipInCount = skipInLast - skipInFrom + 1
+                let skipShuffledD = skipInCount * p1
+                let skipFrameOffset = (dOff + 1) - skipInFrom * p1
+                if vaeDebugLogs { perf?("  [DTS-SKIP] d=\(d) dOff=\(dOff) outFrames=\(outFrames) | skipInFrom=\(skipInFrom) skipInCount=\(skipInCount) skipShuffledD=\(skipShuffledD) skipFrameOffset=\(skipFrameOffset)") }
+                var skipSlice = temporalRangeGPU(x, B: B, C: C, D: D, H: H, W: W, from: skipInFrom, count: skipInCount)
+                pool.reset(keeping: [x.buffer, outBuf, shuffled.buffer, skipSlice.buffer]); pool.purge()
+                var skipShuffled = pixelShuffle3d(skipSlice, B: B, C_out: skipC, D_in: skipInCount, H_in: H, W_in: W,
+                                                 p1: p1, p2: p2, p3: p3)
+                if numRepeat > 1 {
+                    let tmp = skipShuffled
+                    skipShuffled = repeatChannels(tmp, B: B, C: skipC, spatialSize: skipInCount * p1 * newH * newW, repeats: numRepeat)
+                }
+                if skipFrameOffset > 0 || skipShuffledD > outFrames {
+                    let tmp = skipShuffled
+                    skipShuffled = temporalRangeGPU(tmp, B: B, C: shuffleC, D: skipShuffledD, H: newH, W: newW,
+                                                    from: skipFrameOffset, count: outFrames)
+                }
+                pool.reset(keeping: [x.buffer, outBuf, shuffled.buffer, skipShuffled.buffer]); pool.purge()
+
+                // ── Add + write ──────────────────────────────────────────
+                let added = elemAdd(shuffled, skipShuffled)
+                pool.reset(keeping: [x.buffer, outBuf, added.buffer]); pool.purge()
+                temporalWriteGPU(added, into: outTensor, B: B, C: shuffleC, D_out: outDfull, H: newH, W: newW,
+                                 dOffset: dOff, count: outFrames)
+                pool.reset(keeping: [x.buffer, outBuf]); pool.purge()
+                dOff += outFrames
+                d += tileCount
             }
+            var h = outTensor
+            perf?(String(format: "  dts_conv(%d→%d): %.1fms", C, convOutC, (CFAbsoluteTimeGetCurrent() - t0) * 1000) + memTag())
+            perf?(String(format: "  dts_shuffle: 0.0ms (fused into tiled conv)"))
+            pool.reset(keeping: [h.buffer]); pool.purge()
 
-            result = elemAdd(h, x_repeated)
+            result = h
         } else {
             var t0nb = CFAbsoluteTimeGetCurrent()
             var h = causalConv3d(x, conv: weights.conv, B: B, C_in: C, D: D, H: H, W: W, causal: causal)
-            perf?(String(format: "  dts_conv(%d→%d): %.1fms [MEM] %dMB", C, weights.conv.C_out, (CFAbsoluteTimeGetCurrent() - t0nb) * 1000, MetalContext.shared.device.currentAllocatedSize / 1048576))
+            perf?(String(format: "  dts_conv(%d→%d): %.1fms", C, weights.conv.C_out, (CFAbsoluteTimeGetCurrent() - t0nb) * 1000) + memTag())
             pool.reset(keeping: [h.buffer]); pool.purge()
             let convOutC = weights.conv.C_out
             h = pixelShuffle3d(h, B: B, C_out: convOutC / prodStride, D_in: D, H_in: H, W_in: W,

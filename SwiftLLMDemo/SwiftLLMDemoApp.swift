@@ -2,25 +2,22 @@ import SwiftUI
 
 @main
 struct SwiftLLMDemoApp: App {
-    @State private var selectedTab = 2
+    @State private var selectedTab = 0
+
     var body: some Scene {
         WindowGroup {
             TabView(selection: $selectedTab) {
-                ContentView()
-                    .tabItem {
-                        Label("LLM", systemImage: "text.bubble")
-                    }
-                    .tag(0)
-                VAEView()
-                    .tabItem {
-                        Label("VAE", systemImage: "photo.stack")
-                    }
-                    .tag(1)
                 VideoView()
                     .tabItem {
                         Label("Video", systemImage: "film.stack")
                     }
-                    .tag(2)
+                    .tag(0)
+
+                ContentView()
+                    .tabItem {
+                        Label("LLM", systemImage: "text.bubble")
+                    }
+                    .tag(1)
             }
             .preferredColorScheme(.dark)
         }

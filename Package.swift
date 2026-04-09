@@ -19,7 +19,10 @@ let package = Package(
         ),
         .testTarget(
             name: "SwiftLLMTests",
-            dependencies: ["SwiftLLM"]
+            dependencies: [
+                "SwiftLLM",
+                .product(name: "FlashAttention", package: "metal-flash-attention"),
+            ]
         ),
     ]
 )

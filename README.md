@@ -1,9 +1,14 @@
-# SwiftLLM
+# swift-ltx
 
-Minimal Swift LLM inference on Apple GPU. Runs Llama-family models with 4-bit quantization (MLX format) on macOS and iOS.
+Swift + Metal experiments for local Apple Silicon inference, now focused primarily on LTX-Video generation.
+
+The demo app currently exposes:
+- an LTX video generation tab with a refactored two-pass DiT + upsampler + VAE pipeline
+- the older LLM tab for local testing and benchmarking
 
 ## Features
 
+- **LTX-Video pipeline** — streamed DiT block loading, latent upsampler, VAE decode
 - **Flash Attention** via [metal-flash-attention](https://github.com/philipturner/metal-flash-attention) with monolithic IR kernels
 - **Quantized GEMM** — 4-bit dequant directly to registers, assembled in-process via [MetalASM](https://github.com/mpsops/MetalASM)
 - **Optimized naive kernels** — parallel RMS norm, vectorized matvec, fused SiLU+multiply
@@ -20,8 +25,9 @@ Minimal Swift LLM inference on Apple GPU. Runs Llama-family models with 4-bit qu
 
 1. Clone with the [metal-flash-attention](https://github.com/philipturner/metal-flash-attention) dependency next to this repo
 2. Open `SwiftLLMDemo.xcodeproj` in Xcode
-3. Set the model path to a HuggingFace directory containing `config.json`, `tokenizer.json`, and `*.safetensors` (MLX 4-bit quantized)
-4. Build & Run
+3. Put model files under `~/Models/SwiftLLM/` or point the app at your own paths
+4. For the LLM tab, set the model path to a HuggingFace directory containing `config.json`, `tokenizer.json`, and `*.safetensors` (MLX 4-bit quantized)
+5. Build & Run
 
 ## Model
 
