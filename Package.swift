@@ -8,7 +8,7 @@ let package = Package(
         .library(name: "SwiftLLM", targets: ["SwiftLLM"]),
     ],
     dependencies: [
-        .package(path: "../mps-flash-attention/metal-flash-attention"),  // FlashAttention kernels (includes MetalASM)
+        .package(url: "https://github.com/imperatormk/metal-flash-attention.git", branch: "causal"),  // FlashAttention kernels (includes MetalASM)
     ],
     targets: [
         .target(
